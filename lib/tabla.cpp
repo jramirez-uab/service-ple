@@ -1,0 +1,135 @@
+#include "tabla.hpp"
+
+#include <fcntl.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <cstring>
+
+#include "protocolo.hpp"
+
+namespace sple {
+
+namespace {
+struct Fd {  // descriptor que se cierra solo
+  int fd;
+  explicit Fd(int f) : fd(f) {}
+  ~Fd() { if (fd >= 0) ::close(fd); }
+  Fd(const Fd&) = delete;
+  Fd& operator=(const Fd&) = delete;
+};
+
+struct Lector {
+  const std::string& s;
+  size_t i = 0;
+  void esp() { while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i]))) ++i; }
+  [[noreturn]] void error(const char* q) { throw std::runtime_error(std::string("JSON: ") + q + " en la posición " + std::to_string(i)); }
+  char ver() { esp(); if (i >= s.size()) error("fin inesperado"); return s[i]; }
+  void esperar(char c) { if (ver() != c) error("carácter inesperado"); ++i; }
+  std::string cadena() {
+    esperar('"');
+    std::string r;
+    while (i < s.size() && s[i] != '"') {
+      if (s[i] == '\\') { ++i; if (i >= s.size()) error("escape"); }
+      r += s[i++];
+    }
+    esperar('"');
+    return r;
+  }
+  Json valor() {
+    char c = ver();
+    if (c == '{') {
+      ++i; std::map<std::string, Json> m;
+      if (ver() == '}') { ++i; return {m}; }
+      for (;;) {
+        std::string k = cadena(); esperar(':'); m.emplace(std::move(k), valor());
+        if (ver() == ',') { ++i; continue; }
+        esperar('}'); return {m};
+      }
+    }
+    if (c == '[') {
+      ++i; std::vector<Json> l;
+      if (ver() == ']') { ++i; return {l}; }
+      for (;;) {
+        l.push_back(valor());
+        if (ver() == ',') { ++i; continue; }
+        esperar(']'); return {l};
+      }
+    }
+    if (c == '"') return {cadena()};
+    if (c == '-' || std::isdigit(static_cast<unsigned char>(c))) {
+      size_t f; long long n = std::stoll(s.substr(i, 32), &f); i += f; return {n};
+    }
+    if (s.compare(i, 4, "null") == 0) { i += 4; return {nullptr}; }
+    error("valor no admitido");
+  }
+};
+}  // namespace
+
+// "...shard_N.weight" → N; si no, -1
+int numero_de_trozo(const std::string& k) {
+  static const std::string fin = ".weight", ini = ".shard_";
+  if (!k.ends_with(fin)) return -1;
+  auto p = k.rfind(ini);
+  if (p == std::string::npos) return -1;
+  auto num = k.substr(p + ini.size(), k.size() - fin.size() - p - ini.size());
+  if (num.empty() || num.size() > 6 || !std::ranges::all_of(num, [](char c) { return c >= '0' && c <= '9'; })) return -1;
+  return std::stoi(num);
+}
+
+Json parse_json(const std::string& s) {
+  Lector l{s};
+  Json j = l.valor();
+  return j;
+}
+
+uint64_t DescTabla::huella() const { return fnv1a(cabecera.data(), cabecera.size()); }
+
+DescTabla leer_cabecera(const std::string& fichero) {
+  Fd f(::open(fichero.c_str(), O_RDONLY | O_CLOEXEC));
+  const int fd = f.fd;
+  if (fd < 0) throw std::runtime_error("no se puede abrir " + fichero + ": " + std::strerror(errno));
+  uint64_t n = 0;
+  if (::pread(fd, &n, 8, 0) != 8 || n == 0 || n > (64u << 20)) { throw std::runtime_error("cabecera safetensors no válida"); }
+  DescTabla d;
+  d.cabecera.resize(n);
+  if (::pread(fd, d.cabecera.data(), n, 8) != static_cast<ssize_t>(n)) { throw std::runtime_error("cabecera safetensors corta"); }
+  d.inicio_datos = 8 + n;
+  Json j = parse_json(d.cabecera);
+  uint64_t escala_desp = 0;
+  bool hay_escala = false;
+  for (const auto& [k, v] : j.obj()) {
+    if (k == "__metadata__") continue;
+    const auto& o = v.obj();
+    const auto& off = o.at("data_offsets").lista();
+    const auto& forma = o.at("shape").lista();
+    int numero = numero_de_trozo(k);
+    if (numero >= 0) {
+      if (o.at("dtype").cad() != "F8_E4M3" || forma.size() != 2) throw std::runtime_error("trozo con formato inesperado: " + k);
+      uint32_t bf = static_cast<uint32_t>(forma[1].ent());
+      if (d.bytes_fila && d.bytes_fila != bf) throw std::runtime_error("trozos con anchos distintos");
+      d.bytes_fila = bf;
+      uint64_t filas = static_cast<uint64_t>(forma[0].ent());
+      if (static_cast<uint64_t>(off[1].ent() - off[0].ent()) != filas * bf) throw std::runtime_error("tamaño de trozo incoherente: " + k);
+      d.trozos.push_back({numero, filas, d.inicio_datos + static_cast<uint64_t>(off[0].ent())});
+    } else if (k.ends_with("weight_scale")) {
+      if (o.at("dtype").cad() != "BF16") throw std::runtime_error("escala no BF16");
+      escala_desp = d.inicio_datos + static_cast<uint64_t>(off[0].ent());
+      hay_escala = true;
+    }
+  }
+  if (d.trozos.empty() || !hay_escala) { throw std::runtime_error("el fichero no parece una tabla PLE (faltan trozos o escala)"); }
+  if (::pread(fd, &d.escala_bf16, 2, static_cast<off_t>(escala_desp)) != 2) { throw std::runtime_error("no se puede leer la escala"); }
+  std::ranges::sort(d.trozos, {}, &Trozo::numero);
+  d.filas_por_trozo = d.trozos.front().filas;
+  for (size_t i = 0; i < d.trozos.size(); ++i) {
+    const auto& t = d.trozos[i];
+    if (t.numero != static_cast<int>(i)) throw std::runtime_error("falta el trozo " + std::to_string(i));
+    if (i + 1 < d.trozos.size() && t.filas != d.filas_por_trozo) throw std::runtime_error("trozo intermedio con otro tamaño");
+    if (t.filas > d.filas_por_trozo) throw std::runtime_error("último trozo mayor que los demás");
+  }
+  d.filas = d.filas_por_trozo * (d.trozos.size() - 1) + d.trozos.back().filas;
+  return d;
+}
+
+}  // namespace sple

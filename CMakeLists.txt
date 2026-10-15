@@ -1,0 +1,37 @@
+# service-ple: Flash-Next / Engram-style PLE tables served over the network (server + per-machine agent + client library)
+cmake_minimum_required(VERSION 3.22)
+project(service-ple LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+option(SPLE_SANITIZE "Build with AddressSanitizer and UBSan" OFF)
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE RelWithDebInfo)
+endif()
+add_compile_options(-Wall -Wextra)
+if(SPLE_SANITIZE)
+  add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
+  add_link_options(-fsanitize=address,undefined)
+endif()
+find_package(Threads REQUIRED)
+
+add_library(sple_tabla STATIC lib/tabla.cpp)
+target_include_directories(sple_tabla PUBLIC lib)
+
+# client library with a C ABI (ctypes from Python engines, direct link from C++ engines)
+add_library(serviceple SHARED lib/cliente.cpp)
+target_include_directories(serviceple PUBLIC lib)
+target_link_libraries(serviceple PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+
+add_executable(service-ple-server server/main.cpp)
+target_link_libraries(service-ple-server PRIVATE sple_tabla Threads::Threads)
+
+add_executable(service-ple-agent agent/main.cpp lib/cliente.cpp)
+target_link_libraries(service-ple-agent PRIVATE sple_tabla Threads::Threads ${CMAKE_DL_LIBS})
+
+foreach(t prueba caidas perdidas)
+  add_executable(service-ple-test-${t} tests/${t}.cpp lib/cliente.cpp)
+  target_link_libraries(service-ple-test-${t} PRIVATE sple_tabla Threads::Threads ${CMAKE_DL_LIBS})
+endforeach()
+
+install(TARGETS service-ple-server service-ple-agent serviceple)

@@ -1,0 +1,9 @@
+service-ple
+Copyright 2026 Jorge Ramírez Espejo
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Developed with the support of the Department of Computer Science (Departament de Ciències de la Computació),
+Universitat Autònoma de Barcelona, which provided the hardware used to build and measure it.
+
+This repository contains no model weights. The PLE tables it serves belong to their models and keep their own licenses.
