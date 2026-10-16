@@ -13,4 +13,11 @@ kill $A; wait $A 2>/dev/null || true
 $P --servidor "unix:$T/a.sock;127.0.0.1:18499" | tail -1
 $B/service-ple-agent --socket $T/b.sock --filas 1024 --fichero $T/t.safetensors > $T/b.log 2>&1 & sleep 2
 $P --servidor "unix:$T/b.sock" | tail -1
+# the engine starts before the agent (falls back to the server) and must move to the agent when it appears (about 35 s)
+$B/service-ple-test-preferido "unix:$T/c.sock;127.0.0.1:18499" 36 > $T/p.out 2>&1 & Q=$!; sleep 2
+$B/service-ple-agent --servidor 127.0.0.1:18499 --socket $T/c.sock --filas 1024 > $T/c.log 2>&1 & C=$!
+wait $Q || true; tail -1 $T/p.out; kill $C; wait $C 2>/dev/null || true
 $B/service-ple-test-robustez $T | tail -1
+# a bad numeric option is a usage error (exit 2), not an abort
+r=0; $B/service-ple-server --fichero $T/t.safetensors --puerto abc 2>/dev/null || r=$?; a=0; $B/service-ple-agent --socket $T/x.sock --filas abc 2>/dev/null || a=$?
+[ $r = 2 ] && [ $a = 2 ] && echo "RESULTADO: OK" || echo "RESULTADO: FALLO (opciones: servidor $r, agente $a)"

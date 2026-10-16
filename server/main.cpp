@@ -108,11 +108,32 @@ struct Estadisticas {
   std::atomic<uint64_t> peticiones{0}, filas{0}, conexiones{0}, activas{0}, errores{0};
 };
 
+void atender_conexion(int fd, const std::string& quien, const DescTabla& d, const uint8_t* tabla, Estadisticas& e);
+
+// hilo de una conexión: una excepción aquí (p. ej. bad_alloc con una petición de 640 MB y poca RAM) no puede tirar el servidor entero
 void atender(int fd, std::string quien, const DescTabla& d, const uint8_t* tabla, Estadisticas& e) {
   ++e.conexiones; ++e.activas;
+  try {
+    atender_conexion(fd, quien, d, tabla, e);
+  } catch (const std::exception& ex) {
+    ++e.errores;
+    log("{}: error ({}); se cierra la conexión", quien, ex.what());
+  }
+  ::close(fd);
+  --e.activas;
+  log("cierra {}", quien);
+}
+
+void atender_conexion(int fd, const std::string& quien, const DescTabla& d, const uint8_t* tabla, Estadisticas& e) {
   log("conexión de {}", quien);
   int uno = 1;
   ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &uno, sizeof uno);
+  // un cliente cuya máquina se apaga o pierde la red no cierra: sin keepalive, este hilo esperaría en recv para siempre
+  int inactivo = 60, intervalo = 10, sondas = 6;
+  ::setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &uno, sizeof uno);
+  ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &inactivo, sizeof inactivo);
+  ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intervalo, sizeof intervalo);
+  ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &sondas, sizeof sondas);
   const Info info{d.filas, d.bytes_fila, d.escala_bf16, 0, d.huella()};
   std::vector<uint32_t> ids;
   std::vector<uint8_t> salida;
@@ -152,9 +173,6 @@ void atender(int fd, std::string quien, const DescTabla& d, const uint8_t* tabla
     enviar_todo(fd, &r, sizeof r);
     break;
   }
-  ::close(fd);
-  --e.activas;
-  log("cierra {}", quien);
 }
 
 }  // namespace
@@ -166,9 +184,14 @@ int main(int argc, char** argv) {
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto sig = [&] { if (i + 1 >= argc) { std::fprintf(stderr, "falta el valor de %s\n", a.c_str()); std::exit(2); } return std::string(argv[++i]); };
+    auto num = [&] {  // un valor no numérico es un error de uso, no un std::terminate
+      std::string v = sig();
+      try { size_t f; int n = std::stoi(v, &f); if (f == v.size() && n > 0) return n; } catch (const std::exception&) {}
+      std::fprintf(stderr, "valor no válido para %s: %s\n", a.c_str(), v.c_str()); std::exit(2);
+    };
     if (a == "--fichero") fichero = sig();
-    else if (a == "--puerto") puerto = std::stoi(sig());
-    else if (a == "--hilos-carga") hilos = std::stoi(sig());
+    else if (a == "--puerto") puerto = num();
+    else if (a == "--hilos-carga") hilos = num();
     else if (a == "--mlock") bloquear = true;
     else { std::fprintf(stderr, "uso: %s --fichero ple-fp8.safetensors [--puerto 18460] [--hilos-carga 8] [--mlock]\n", argv[0]); return 2; }
   }

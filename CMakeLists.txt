@@ -29,7 +29,7 @@ target_link_libraries(service-ple-server PRIVATE sple_tabla Threads::Threads)
 add_executable(service-ple-agent agent/main.cpp lib/cliente.cpp)
 target_link_libraries(service-ple-agent PRIVATE sple_tabla Threads::Threads ${CMAKE_DL_LIBS})
 
-foreach(t prueba caidas perdidas robustez)
+foreach(t prueba caidas perdidas robustez preferido)
   add_executable(service-ple-test-${t} tests/${t}.cpp lib/cliente.cpp)
   target_link_libraries(service-ple-test-${t} PRIVATE sple_tabla Threads::Threads ${CMAKE_DL_LIBS})
 endforeach()

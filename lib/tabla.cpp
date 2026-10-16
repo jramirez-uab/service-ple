@@ -1,6 +1,7 @@
 #include "tabla.hpp"
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -84,6 +85,8 @@ int numero_de_trozo(const std::string& k) {
 Json parse_json(const std::string& s) {
   Lector l{s};
   Json j = l.valor();
+  l.esp();  // safetensors rellena la cabecera con espacios; cualquier otra cosa detrás del JSON es un fichero dañado
+  if (l.i != s.size()) l.error("datos detrás del JSON");
   return j;
 }
 
@@ -94,6 +97,8 @@ DescTabla leer_cabecera(const std::string& fichero) {
   const int fd = f.fd;
   if (fd < 0) throw std::runtime_error("no se puede abrir " + fichero + ": " + std::strerror(errno));
   uint64_t n = 0;
+  struct stat st{};
+  if (::fstat(fd, &st) != 0) throw std::runtime_error("no se puede leer el tamaño de " + fichero);
   if (::pread(fd, &n, 8, 0) != 8 || n == 0 || n > (64u << 20)) { throw std::runtime_error("cabecera safetensors no válida"); }
   DescTabla d;
   d.cabecera.resize(n);
@@ -102,7 +107,8 @@ DescTabla leer_cabecera(const std::string& fichero) {
   Json j = parse_json(d.cabecera);
   uint64_t escala_desp = 0;
   bool hay_escala = false;
-  for (const auto& [k, v] : j.obj()) {
+  const uint64_t datos = static_cast<uint64_t>(st.st_size) > d.inicio_datos ? static_cast<uint64_t>(st.st_size) - d.inicio_datos : 0;
+  for (const auto& [k, v] : j.obj()) try {
     if (k == "__metadata__") continue;
     const auto& o = v.obj();
     const auto& off = o.at("data_offsets").lista();
@@ -110,6 +116,7 @@ DescTabla leer_cabecera(const std::string& fichero) {
     int numero = numero_de_trozo(k);
     // desplazamientos del fichero, que puede estar dañado: 0 <= inicio <= fin
     if (off.size() != 2 || off[0].ent() < 0 || off[1].ent() < off[0].ent()) throw std::runtime_error("data_offsets no válidos: " + k);
+    if (static_cast<uint64_t>(off[1].ent()) > datos) throw std::runtime_error("datos fuera del fichero (¿truncado?): " + k);
     if (numero >= 0) {
       if (o.at("dtype").cad() != "F8_E4M3" || forma.size() != 2) throw std::runtime_error("trozo con formato inesperado: " + k);
       if (forma[0].ent() <= 0 || forma[1].ent() <= 0 || forma[1].ent() > (1 << 20)) throw std::runtime_error("forma no válida: " + k);
@@ -121,9 +128,14 @@ DescTabla leer_cabecera(const std::string& fichero) {
       d.trozos.push_back({numero, filas, d.inicio_datos + static_cast<uint64_t>(off[0].ent())});
     } else if (k.ends_with("weight_scale")) {
       if (o.at("dtype").cad() != "BF16") throw std::runtime_error("escala no BF16");
+      if (hay_escala) throw std::runtime_error("más de una escala (weight_scale): " + k);
       escala_desp = d.inicio_datos + static_cast<uint64_t>(off[0].ent());
       hay_escala = true;
     }
+  } catch (const std::logic_error& e) {  // falta una clave o tiene otro tipo (std::out_of_range, std::bad_variant_access): decir cuál
+    throw std::runtime_error("tensor " + k + " mal descrito en la cabecera (" + e.what() + ")");
+  } catch (const std::bad_variant_access&) {
+    throw std::runtime_error("tensor " + k + " mal descrito en la cabecera");
   }
   if (d.trozos.empty() || !hay_escala) { throw std::runtime_error("el fichero no parece una tabla PLE (faltan trozos o escala)"); }
   if (::pread(fd, &d.escala_bf16, 2, static_cast<off_t>(escala_desp)) != 2) { throw std::runtime_error("no se puede leer la escala"); }
@@ -135,6 +147,8 @@ DescTabla leer_cabecera(const std::string& fichero) {
     if (i + 1 < d.trozos.size() && t.filas != d.filas_por_trozo) throw std::runtime_error("trozo intermedio con otro tamaño");
     if (t.filas > d.filas_por_trozo) throw std::runtime_error("último trozo mayor que los demás");
   }
+  // el servidor reserva filas_por_trozo × trozos × bytes_fila: sin desbordar
+  if (d.filas_por_trozo > UINT64_MAX / d.bytes_fila / d.trozos.size()) throw std::runtime_error("tabla demasiado grande");
   d.filas = d.filas_por_trozo * (d.trozos.size() - 1) + d.trozos.back().filas;
   return d;
 }

@@ -23,7 +23,7 @@ inline constexpr uint32_t VIAS = 8;
 inline constexpr uint32_t MAX_BYTES_FILA = 160;
 
 struct alignas(64) CabeceraCache {
-  uint64_t magia;
+  alignas(8) uint64_t magia;  // se accede con std::atomic_ref: la escribe el agente al final, la leen los motores
   uint64_t huella;      // tabla a la que pertenecen las filas
   uint64_t conjuntos;   // potencia de 2
   uint32_t bytes_fila;
@@ -53,23 +53,31 @@ class Cache {
   // crear (agente): conjuntos = filas / VIAS redondeado a potencia de 2
   static Cache crear(uint64_t huella, uint32_t bytes_fila, uint64_t filas) {
     if (bytes_fila > MAX_BYTES_FILA) throw std::runtime_error("filas demasiado anchas para la caché");
+    if (filas > (uint64_t{1} << 36)) throw std::runtime_error("caché demasiado grande");  // y el bucle de abajo no puede desbordar
     uint64_t c = 1;
     while (c * VIAS < filas) c <<= 1;
     std::string ruta = ruta_cache(huella);
     size_t tam = sizeof(CabeceraCache) + c * sizeof(Conjunto);
-    int fd = ::open(ruta.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0660);
-    if (fd < 0) throw std::runtime_error("no se puede crear " + ruta);
-    struct stat st{};
-    ::fstat(fd, &st);
-    bool reutilizar = static_cast<size_t>(st.st_size) == tam;
-    if (!reutilizar && ::ftruncate(fd, static_cast<off_t>(tam)) != 0) { ::close(fd); throw std::runtime_error("ftruncate " + ruta); }
+    // de otro tamaño (otro --filas): fichero nuevo, nunca ftruncate del que tienen mapeado los motores (con uno más pequeño, SIGBUS);
+    // los motores siguen con el antiguo, que sigue siendo correcto (filas que no cambian), hasta que ven el nuevo (vigente())
+    int fd = ::open(ruta.c_str(), O_RDWR | O_CLOEXEC);
+    bool reutilizar = false;
+    if (fd >= 0) {
+      struct stat st{};
+      reutilizar = ::fstat(fd, &st) == 0 && static_cast<size_t>(st.st_size) == tam;
+      if (!reutilizar) { ::close(fd); ::unlink(ruta.c_str()); fd = -1; }
+    }
+    if (fd < 0) {
+      fd = ::open(ruta.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0660);
+      if (fd < 0) throw std::runtime_error("no se puede crear " + ruta);
+      if (::ftruncate(fd, static_cast<off_t>(tam)) != 0) { ::close(fd); throw std::runtime_error("ftruncate " + ruta); }
+    }
     Cache k(fd, tam);
     auto* cab = k.cab_;
-    if (!reutilizar || cab->magia != MAGIA_CACHE || cab->huella != huella || cab->conjuntos != c || cab->bytes_fila != bytes_fila) {
+    if (!reutilizar || std::atomic_ref<uint64_t>(cab->magia).load(std::memory_order_acquire) != MAGIA_CACHE || cab->huella != huella || cab->conjuntos != c || cab->bytes_fila != bytes_fila) {
       std::memset(static_cast<void*>(k.base_), 0, tam);  // nueva (o de otra tabla/tamaño): vacía
       cab->huella = huella; cab->conjuntos = c; cab->bytes_fila = bytes_fila; cab->vias = VIAS;
-      std::atomic_thread_fence(std::memory_order_release);
-      cab->magia = MAGIA_CACHE;
+      std::atomic_ref<uint64_t>(cab->magia).store(MAGIA_CACHE, std::memory_order_release);  // la última: un motor no ve una cabecera a medias
       k.reutilizada_ = false;
     } else {
       // un agente anterior que murió a medio escribir deja huecos con versión impar: los lectores los saltarían siempre y el escritor,
@@ -82,6 +90,7 @@ class Cache {
           }
       k.reutilizada_ = true;
     }
+    k.conjuntos_ = c; k.bf_ = bytes_fila; k.huella_ = huella;
     return k;
   }
 
@@ -96,9 +105,11 @@ class Cache {
     // la cabecera viene de un fichero de /dev/shm: se valida todo lo que luego da tamaños o índices
     const auto& cab = *k.cab_;
     const uint64_t c = cab.conjuntos;
-    if (cab.magia != MAGIA_CACHE || cab.huella != huella || cab.vias != VIAS || cab.bytes_fila == 0 || cab.bytes_fila > MAX_BYTES_FILA ||
+    if (std::atomic_ref<uint64_t>(k.cab_->magia).load(std::memory_order_acquire) != MAGIA_CACHE || cab.huella != huella || cab.vias != VIAS || cab.bytes_fila == 0 || cab.bytes_fila > MAX_BYTES_FILA ||
         c == 0 || (c & (c - 1)) != 0 || c > (static_cast<size_t>(st.st_size) - sizeof(CabeceraCache)) / sizeof(Conjunto) ||
         sizeof(CabeceraCache) + c * sizeof(Conjunto) != static_cast<size_t>(st.st_size)) return false;
+    // copia propia de la geometría: lo que haya después en la cabecera compartida no puede llevar a este proceso fuera de su mmap
+    k.conjuntos_ = c; k.bf_ = cab.bytes_fila; k.huella_ = huella;
     out = std::move(k);
     return true;
   }
@@ -106,19 +117,30 @@ class Cache {
   Cache() = default;
   Cache(Cache&& o) noexcept { *this = std::move(o); }
   Cache& operator=(Cache&& o) noexcept {
-    if (this != &o) { cerrar(); base_ = o.base_; tam_ = o.tam_; cab_ = o.cab_; conj_ = o.conj_; reutilizada_ = o.reutilizada_; o.base_ = nullptr; }
+    if (this != &o) {
+      cerrar();
+      base_ = o.base_; tam_ = o.tam_; cab_ = o.cab_; conj_ = o.conj_; reutilizada_ = o.reutilizada_;
+      conjuntos_ = o.conjuntos_; bf_ = o.bf_; huella_ = o.huella_; ino_ = o.ino_;
+      o.base_ = nullptr;
+    }
     return *this;
   }
   ~Cache() { cerrar(); }
   explicit operator bool() const { return base_ != nullptr; }
   bool reutilizada() const { return reutilizada_; }
-  uint64_t capacidad() const { return cab_->conjuntos * VIAS; }
+  uint64_t capacidad() const { return conjuntos_ * VIAS; }
+  uint32_t bytes_fila() const { return bf_; }
+  // el fichero de /dev/shm sigue siendo este (el agente no lo ha sustituido por otro de distinto tamaño)
+  bool vigente() const {
+    struct stat st{};
+    return ::stat(ruta_cache(huella_).c_str(), &st) == 0 && st.st_ino == ino_;
+  }
   CabeceraCache& cabecera() { return *cab_; }
 
   // lector: copia la fila si está; marca el bit de uso
   bool leer(uint64_t id, uint8_t* dst) const {
     Conjunto& s = conj_[conjunto(id)];
-    const uint32_t bf = cab_->bytes_fila;
+    const uint32_t bf = bf_;
     for (auto& h : s.h) {
       uint32_t v1 = h.version.load(std::memory_order_acquire);
       if (v1 & 1u) continue;
@@ -149,7 +171,7 @@ class Cache {
     v->version.store(ver + 1, std::memory_order_relaxed);  // impar: escribiéndose
     std::atomic_thread_fence(std::memory_order_release);
     std::atomic_ref<uint64_t>(v->id).store(id + 1, std::memory_order_relaxed);
-    std::memcpy(v->fila, src, cab_->bytes_fila);
+    std::memcpy(v->fila, src, bf_);
     v->uso.store(1, std::memory_order_relaxed);
     v->version.store(ver + 2, std::memory_order_release);
     cab_->insertadas.fetch_add(1, std::memory_order_relaxed);
@@ -157,6 +179,8 @@ class Cache {
 
  private:
   Cache(int fd, size_t tam) : tam_(tam) {
+    struct stat st{};
+    if (::fstat(fd, &st) == 0) ino_ = st.st_ino;
     void* p = ::mmap(nullptr, tam, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     ::close(fd);
     if (p == MAP_FAILED) throw std::runtime_error("mmap de la caché");
@@ -167,13 +191,16 @@ class Cache {
   // id lo escribe el agente mientras los motores lo leen: atómico (relajado; el orden lo da la versión)
   static uint64_t id_de(Hueco& h) { return std::atomic_ref<uint64_t>(h.id).load(std::memory_order_relaxed); }
   void cerrar() { if (base_) ::munmap(base_, tam_); base_ = nullptr; }
-  uint64_t conjunto(uint64_t id) const { return (id * 0x9E3779B97F4A7C15ull >> 20) & (cab_->conjuntos - 1); }
+  uint64_t conjunto(uint64_t id) const { return (id * 0x9E3779B97F4A7C15ull >> 20) & (conjuntos_ - 1); }
 
   uint8_t* base_ = nullptr;
   size_t tam_ = 0;
   CabeceraCache* cab_ = nullptr;
   Conjunto* conj_ = nullptr;
   bool reutilizada_ = false;
+  uint64_t conjuntos_ = 0, huella_ = 0;
+  uint32_t bf_ = 0;
+  ino_t ino_ = 0;
 };
 
 }  // namespace sple

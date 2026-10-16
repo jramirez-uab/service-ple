@@ -12,6 +12,7 @@ namespace detalle {
 inline void uno(std::string& out, const std::string& spec, const std::string& s) {
   std::string f = "%" + spec + "s";
   int n = std::snprintf(nullptr, 0, f.c_str(), s.c_str());
+  if (n < 0) return;  // error de codificación: nada (no un tamaño de SIZE_MAX)
   std::string b(static_cast<size_t>(n) + 1, '\0');
   std::snprintf(b.data(), b.size(), f.c_str(), s.c_str());
   out.append(b.data(), static_cast<size_t>(n));

@@ -239,13 +239,19 @@ int main(int argc, char** argv) {
   for (int i = 1; i < argc; i += 2) {
     std::string a = argv[i];
     if (i + 1 >= argc) { std::fprintf(stderr, "falta el valor de %s\n", a.c_str()); return 2; }
+    // un valor no numérico es un error de uso, no un std::terminate
+    auto num = [&](uint64_t max) -> uint64_t {
+      std::string v = argv[i + 1];
+      try { size_t f; uint64_t n = std::stoull(v, &f); if (f == v.size() && n > 0 && n <= max) return n; } catch (const std::exception&) {}
+      std::fprintf(stderr, "valor no válido para %s: %s\n", a.c_str(), v.c_str()); std::exit(2);
+    };
     if (a == "--servidor") servidor = argv[i + 1];
     else if (a == "--socket") socket_ruta = argv[i + 1];
-    else if (a == "--filas") filas = std::stoull(argv[i + 1]);
+    else if (a == "--filas") filas = num(uint64_t{1} << 36);
     else if (a == "--fichero") fichero = argv[i + 1];
-    else if (a == "--hilos-disco") hilos_disco = std::stoi(argv[i + 1]);
-    else if (a == "--fallos-para-disco") fallos_para_disco = std::stoi(argv[i + 1]);
-    else if (a == "--reintento-red") reintento_red = std::stoi(argv[i + 1]);
+    else if (a == "--hilos-disco") hilos_disco = static_cast<int>(num(1024));
+    else if (a == "--fallos-para-disco") fallos_para_disco = static_cast<int>(num(1u << 20));
+    else if (a == "--reintento-red") reintento_red = static_cast<int>(num(86400));
     else { std::fprintf(stderr, "uso: %s --servidor host:puerto [--socket ruta] [--filas N] [--fichero ple-fp8.safetensors] [--hilos-disco N]\n", argv[0]); return 2; }
   }
   if (servidor.empty() && fichero.empty()) { std::fprintf(stderr, "hace falta --servidor, --fichero o los dos\n"); return 2; }
@@ -283,6 +289,7 @@ int main(int argc, char** argv) {
         ag.servidor ? servidor : fichero,
         ruta_cache(ag.info.huella), ag.cache.capacidad(), ag.cache.capacidad() * sizeof(Hueco) / 1e9, ag.cache.reutilizada() ? ", reutilizada" : ", nueva");
 
+    if (socket_ruta.size() >= sizeof(sockaddr_un::sun_path)) throw std::runtime_error("ruta de socket demasiado larga: " + socket_ruta);
     auto barra = socket_ruta.rfind('/');
     if (barra != std::string::npos) ::mkdir(socket_ruta.substr(0, barra).c_str(), 0755);
     ::unlink(socket_ruta.c_str());
@@ -319,7 +326,9 @@ int main(int argc, char** argv) {
         }
         throw std::runtime_error(std::string("accept: ") + std::strerror(errno));
       }
-      std::thread([&ag, c] { ag.atender(c); }).detach();
+      std::thread([&ag, c] {
+        try { ag.atender(c); } catch (const std::exception& ex) { log("conexión local: error ({}); se cierra", ex.what()); ::close(c); }  // no tirar el agente
+      }).detach();
     }
   } catch (const std::exception& e) {
     log("ERROR: {}", e.what());

@@ -71,7 +71,9 @@ struct Conexion {
   Reloj::time_point caido_desde{}, proximo_intento{}, ultimo_aviso{};
   uint64_t pasos_ceros = 0, filas_ceros = 0;
   bool agotado = false;  // el último fallo fue por tiempo (servidor colgado): no reintentar en el acto
-  Reloj::time_point proxima_cache{};  // sin caché del agente: se vuelve a buscar cada 30 s (el agente puede arrancar después que el motor)
+  Reloj::time_point proxima_cache{};      // sin caché del agente: se vuelve a buscar cada 30 s (el agente puede arrancar después que el motor)
+  size_t usado = 0;                       // índice en destinos del que está en uso
+  Reloj::time_point proximo_preferido{};  // en un destino de respaldo: cada 30 s se prueba el primero (el agente puede haber vuelto)
 
   ~Conexion() { cerrar(); }
   void cerrar() { if (fd >= 0) ::close(fd); fd = -1; }
@@ -79,15 +81,11 @@ struct Conexion {
   // prueba los destinos en orden
   bool conectar() {
     std::string errores;
-    for (const auto& d : destinos) {
-      if (d.starts_with("unix:")) { host = d; puerto = ""; }
-      else {
-        auto p = d.rfind(':');
-        if (p == std::string::npos) { error = "dirección sin puerto: " + d; continue; }
-        host = d.substr(0, p); puerto = d.substr(p + 1);
-        if (!host.empty() && host.front() == '[') host = host.substr(1, host.size() - 2);
-      }
+    for (size_t i = 0; i < destinos.size(); ++i) {
+      if (!elegir(destinos[i])) continue;
       if (conectar_uno()) {
+        usado = i;
+        proximo_preferido = Reloj::now() + std::chrono::seconds(30);
         if (!cache) abrir_cache();  // la del agente de esta máquina, si hay
         return true;
       }
@@ -97,11 +95,37 @@ struct Conexion {
     return false;
   }
 
+  bool elegir(const std::string& d) {
+    if (d.starts_with("unix:")) { host = d; puerto = ""; return true; }
+    auto p = d.rfind(':');
+    if (p == std::string::npos) { error = "dirección sin puerto: " + d; return false; }
+    host = d.substr(0, p); puerto = d.substr(p + 1);
+    if (!host.empty() && host.front() == '[') host = host.substr(1, host.size() - 2);
+    return true;
+  }
+
+  // en un destino de respaldo (p. ej. el servidor porque el agente no estaba al arrancar): volver al preferido en cuanto responda, sin
+  // soltar la conexión actual si no responde (si no, las filas que faltan nunca pasan por el agente ni llenan la caché de la máquina)
+  void volver_al_preferido() {
+    proximo_preferido = Reloj::now() + std::chrono::seconds(30);
+    const int viejo = fd;
+    const std::string h = host, p = puerto, e = error;
+    fd = -1;
+    if (elegir(destinos[0]) && conectar_uno()) {
+      if (viejo >= 0) ::close(viejo);
+      usado = 0;
+      if (!cache) abrir_cache();
+      return;
+    }
+    cerrar();
+    fd = viejo; host = h; puerto = p; error = e;
+  }
+
   void abrir_cache() {
     proxima_cache = Reloj::now() + std::chrono::seconds(30);
     // la caché se elige por la huella de la tabla; su ancho de fila tiene que ser el del servidor (leer() copia bytes_fila de la caché)
     try {
-      if (Cache::abrir(info.huella, cache) && cache.cabecera().bytes_fila != info.bytes_fila) cache = Cache{};
+      if (Cache::abrir(info.huella, cache) && cache.bytes_fila() != info.bytes_fila) cache = Cache{};
     } catch (const std::exception&) { cache = Cache{}; }  // mmap fallido: sin caché (no puede salir una excepción por la interfaz C)
   }
 
@@ -212,15 +236,22 @@ struct Conexion {
     auto* p = static_cast<const uint8_t*>(b);
     while (n) {
       ssize_t r = ::send(fd, p, n, MSG_NOSIGNAL);
-      if (r <= 0) { error = std::string("envío: ") + std::strerror(errno); cerrar(); return false; }
+      if (r <= 0) {
+        agotado = r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);  // como en recibir: un servidor colgado no se reintenta en el acto
+        error = std::string("envío: ") + std::strerror(errno);
+        cerrar();
+        return false;
+      }
       p += r; n -= static_cast<size_t>(r);
     }
     return true;
   }
   bool recibir(void* b, size_t n) {
     auto* p = static_cast<uint8_t*>(b);
+    // SO_RCVTIMEO vale para cada recv: un servidor que manda un byte de vez en cuando lo alargaría sin fin. Tope del total: 2 × espera_ms
+    const auto limite = Reloj::now() + std::chrono::milliseconds(2 * espera_ms);
     while (n) {
-      ssize_t r = ::recv(fd, p, n, 0);
+      ssize_t r = Reloj::now() > limite ? (errno = EAGAIN, -1) : ::recv(fd, p, n, 0);
       if (r <= 0) {
         agotado = r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
         error = r == 0 ? "el servidor cerró la conexión" : agotado ? "sin respuesta en " + std::to_string(espera_ms) + " ms" : std::string("recepción: ") + std::strerror(errno);
@@ -367,7 +398,11 @@ int sple_filas_impl(Conexion* c, const int64_t* ids, uint64_t n, int64_t lo, int
     if (ids[i] >= lo && ids[i] < hi) c->ids.push_back(static_cast<uint32_t>(ids[i]));
   std::ranges::sort(c->ids);
   c->ids.erase(std::unique(c->ids.begin(), c->ids.end()), c->ids.end());
-  if (!c->cache && Reloj::now() >= c->proxima_cache) c->abrir_cache();
+  if (c->usado > 0 && c->fd >= 0 && Reloj::now() >= c->proximo_preferido) c->volver_al_preferido();
+  if (Reloj::now() >= c->proxima_cache) {  // cada 30 s: aparece la caché del agente, o el agente la ha recreado con otro tamaño
+    if (c->cache && !c->cache.vigente()) c->cache = Cache{};
+    if (!c->cache) c->abrir_cache(); else c->proxima_cache = Reloj::now() + std::chrono::seconds(30);
+  }
   if (!c->ids.empty()) {
     // 1) caché compartida de la máquina (fase 2), sin salir del proceso
     c->filas.resize(c->ids.size() * bf);

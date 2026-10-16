@@ -68,7 +68,9 @@ def _huella_local(ruta):
         for b in cab:
             h = ((h ^ b) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
         meta = json.loads(cab)
-        clave = next(k for k in meta if k.endswith("weight_scale"))
+        clave = next((k for k in meta if k.endswith("weight_scale")), None)
+        if clave is None:
+            raise RuntimeError(f"service-ple: {ruta} has no weight_scale tensor (not a PLE table)")
         f.seek(8 + n + meta[clave]["data_offsets"][0])
         return h, struct.unpack("<H", f.read(2))[0]
 
@@ -118,12 +120,15 @@ def patch():
         st = getattr(self, "_sple_buf", None)
         if st is None or st[0].numel() < n:
             # fixed addresses: a captured CUDA graph keeps them, so allocate the maximum once (tokens × heads of the prefetch buffer)
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError("service-ple: buffers too small during CUDA graph capture")
+            if torch.cuda.is_current_stream_capturing() or getattr(self, "_sple_capturado", False):
+                # graphs captured before keep the old addresses: growing the buffers now would leave them reading freed memory
+                raise RuntimeError("service-ple: buffers too small for this batch after CUDA graph capture")
             cap = max(n, self._prefetch_buffer.shape[0] * self._prefetch_buffer.shape[1])
             st = (torch.empty(cap, dtype=torch.int64, pin_memory=True), torch.empty(cap * dim, dtype=torch.uint8, pin_memory=True))
             self._sple_buf = st
         ids_h, filas_h = st
+        if torch.cuda.is_current_stream_capturing():
+            self._sple_capturado = True
         # three steps on the current (prefetch) stream, all capturable: ids GPU→host, network fetch as a host node, rows host→GPU
         ids_h[:n].copy_(input_ids.reshape(-1), non_blocking=True)
         si = self.shard_indices
@@ -169,9 +174,9 @@ def patch():
     def filter_duplicate_safetensors_files(files, folder, index_file):
         try:
             return orig_fdsf(files, folder, index_file)
-        except FileNotFoundError:
+        except FileNotFoundError as e:
             tabla = os.path.join(folder, "ple-fp8.safetensors")
-            if not _direccion() or os.path.exists(tabla):
+            if not _direccion() or os.path.exists(tabla) or "ple-fp8.safetensors" not in str(e):
                 raise
             log.info("service-ple: %s no está en el directorio del modelo; la tabla del servidor no se puede comparar con la local", tabla)
             return [f for f in orig_fdsf(files + [tabla], folder, index_file) if f != tabla]
