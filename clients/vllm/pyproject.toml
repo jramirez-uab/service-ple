@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vllm-service-ple"
-version = "0.2.0"
+version = "0.2.1"
 description = "vLLM plugin: keeps the Flash-Next PLE table out of the vLLM process (per-machine agent with a shared cache, local file and/or central server)"
 requires-python = ">=3.10"
 
