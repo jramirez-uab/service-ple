@@ -11,16 +11,20 @@ pinned allocator: **64 GiB of RAM per server instance**, on every machine that r
 1. **A local service instead of a table inside the engine.** With the plugin, vLLM no longer loads the table: it allocates a 1-row
    placeholder and asks service-ple for the rows of each step. The 64 GiB of pinned RAM per server go away.
 2. **One agent per machine, with a cache shared by every engine on it** (`/dev/shm`, read by the engines without locks). Rows that are not in
-   the cache come from:
-   - **2.1 the local table file** (agent alone, no network): the basic mode. Needs the file on a file system with fast 4 KB random reads
-     (XFS on NVMe measured; not ZFS, see below).
-   - **2.2 a central server** that holds the table in RAM for many machines (the agent forwards the misses; it can still fall back to the
-     local file after N network failures).
+   the cache come from one of two sources, or both; which ones to use depends on your infrastructure and hardware:
+   - **2.1 the local table file** (no network). Needs the file on a file system with fast 4 KB random reads (XFS on NVMe measured; not ZFS,
+     see below).
+   - **2.2 a central server** that holds the one copy of the table in RAM for all the machines, for example on a separate virtual machine
+     without GPU. The agent forwards the misses to it.
+
+   **Combined**, the agent asks the server and falls back to the local file after N consecutive network failures, retrying the network
+   every 30 s. Without either source at hand, the engine goes on with zeros for the missing rows (measured cost below) and reconnects on
+   its own.
 
 ```
   engine ──(thin plugin)──→ libserviceple.so ──→ service-ple-agent (per machine) ──→ service-ple-server (table in RAM)   [2.2]
                                  │                   ├─ shared cache in /dev/shm         (one per site / cluster)
-                                 └─ reads the shared └─ local table file                [2.1, or fallback in 2.2]
+                                 └─ reads the shared └─ local table file                [2.1, or fallback when combined]
                                     cache directly
 ```
 
@@ -31,12 +35,12 @@ pinned allocator: **64 GiB of RAM per server instance**, on every machine that r
 | `libserviceple.so` | Client library with a C ABI. Requests unique sorted ids, scatters rows, fills zeros outside the rank's vocabulary range (exact under tensor parallelism). Degrades to zeros if nothing answers, reconnects on its own, warns in stderr. `sple_encolar` enqueues the fetch as a CUDA **host node** (`cuLaunchHostFunc`), so it works inside captured CUDA graphs. |
 | `clients/vllm` | vLLM general plugin (`vllm-service-ple`). Enabled per server with `--additional-config '{"service_ple": "unix:/run/service-ple/agente.sock;HOST:18460"}'`; inert otherwise. Skips loading the table file, allocates a 1-row placeholder, checks the server's table fingerprint and scale. |
 
-## Measured: agent alone on the local file (mode 2.1, 2026-10-16)
+## Measured: agent on the local file (mode 2.1, 2026-10-16)
 
 vLLM 0.31, Flash-Next EXL3 4.05 bpw on one RTX PRO 6000 (KV fp8, 262k context), agent with a 16 M-row cache (3 GB), table file on XFS on NVMe.
 Prompts are real text (documents and code, 17k-23.5k tokens), each sent once with a new prefix so vLLM recomputes the prefill.
 
-| | server on the same machine, no agent | agent alone, cold cache | agent alone, warm cache |
+| | server on the same machine, no agent | agent on the local file, cold cache | same, warm cache |
 |---|---|---|---|
 | Prefill, 21,328 tokens | 4.98 s | 5.13 s | 4.98 s |
 | Prefill, 23,528 tokens | 5.81 s | 5.85 s | 5.78 s |
@@ -85,8 +89,9 @@ Details and raw numbers: `docs/RESULTS.md` and the access-profile reports in `do
 
 ```
 deploy/install.sh server --table /path/ple-fp8.safetensors --allow "ENGINE_HOST_1 ENGINE_HOST_2"   # machine with the table in RAM
-deploy/install.sh agent  --table /xfs/ple-fp8.safetensors                                         # mode 2.1: agent alone on the local file
-deploy/install.sh agent  --server SERVER_HOST:18460 --table /local/copy/ple-fp8.safetensors      # mode 2.2: each engine machine (table optional)
+deploy/install.sh agent  --table /xfs/ple-fp8.safetensors                                         # mode 2.1: agent on the local file
+deploy/install.sh agent  --server SERVER_HOST:18460                                               # mode 2.2: central server
+deploy/install.sh agent  --server SERVER_HOST:18460 --table /local/copy/ple-fp8.safetensors      # modes 2.2 + 2.1: server, local file as fallback
 deploy/install.sh plugin --python /path/to/vllm-venv/bin/python                                  # each vLLM environment
 ```
 The engine then uses `unix:/run/service-ple/agente.sock` (mode 2) or `HOST:18460` (straight to a server). The client waits up to 30 s for
@@ -108,7 +113,7 @@ Built and tested (`tests/run.sh`, no warnings) on Ubuntu 22.04 (GCC 11.4), Ubunt
 ## Status
 
 **Experimental.** Tested with Qwen3.8 / Swift Flash-Next in vLLM 0.31 (EXL3 checkpoints, TP 1/2 + EP, RTX 3090, L40S, RTX PRO 6000); mode 2.1
-(agent alone on XFS) serves one production engine.
+(agent on XFS) serves one production engine.
 Code comments and the measurement reports in `docs/` are mostly in Spanish.
 
 ## License
