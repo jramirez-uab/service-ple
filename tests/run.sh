@@ -13,3 +13,4 @@ kill $A; wait $A 2>/dev/null || true
 $P --servidor "unix:$T/a.sock;127.0.0.1:18499" | tail -1
 $B/service-ple-agent --socket $T/b.sock --filas 1024 --fichero $T/t.safetensors > $T/b.log 2>&1 & sleep 2
 $P --servidor "unix:$T/b.sock" | tail -1
+$B/service-ple-test-robustez $T | tail -1

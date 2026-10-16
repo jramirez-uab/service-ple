@@ -36,7 +36,7 @@ done
 
 CHANGES=()
 note() { CHANGES+=("$1"); }
-sys() { [ -z "$ROOT" ] && [ $DRY = 0 ] && "$@" || true; }   # real system actions only
+sys() { if [ -z "$ROOT" ] && [ $DRY = 0 ]; then "$@"; fi; }   # real system actions only (a failure stops the installer)
 
 # put_file SRC DST MODE: install only if the content differs; returns 0 if it changed (or would change)
 put_file() {
@@ -124,6 +124,7 @@ E
     build
     bin=0 unit=0
     put_file "$BUILD/service-ple-agent" /usr/local/bin/service-ple-agent 755 && bin=1
+    [ -f "$BUILD/libserviceple.so" ] || { echo "agent: $BUILD/libserviceple.so was not built" >&2; exit 1; }
     put_file "$BUILD/libserviceple.so" /usr/local/lib/libserviceple.so 644 || true
     args="--socket /run/service-ple/agente.sock --filas $ROWS"
     [ -n "$SERVER" ] && args="--servidor $SERVER $args"

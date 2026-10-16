@@ -120,7 +120,7 @@ struct Agente {
   int fallos_seguidos = 0;
   bool modo_disco = false;
   std::chrono::steady_clock::time_point desde{}, proximo_intento_red{};
-  void* servidor = nullptr;
+  std::atomic<void*> servidor{nullptr};  // lo pone un hilo bajo mx_modo y lo leen todos sin cerrojo
   Info info{};
   Cache cache;
   std::mutex mx_escritor;  // un solo escritor en la caché
@@ -139,7 +139,7 @@ struct Agente {
         if (void* h = sple_abrir(direccion.c_str(), e, sizeof e)) {
           Info i{};
           sple_info(h, &i.filas, &i.bytes_fila, &i.escala_bf16, &i.huella);
-          if (i.huella == info.huella) { servidor = h; log("servidor {} disponible: se deja el disco", direccion); }
+          if (i.huella == info.huella) { servidor.store(h); log("servidor {} disponible: se deja el disco", direccion); }
           else { log("el servidor {} sirve otra tabla ({:016x}); se sigue con el disco", direccion, i.huella); sple_cerrar(h); }
         }
       }
@@ -152,7 +152,7 @@ struct Agente {
       if (modo_disco && probar_red) proximo_intento_red = ahora + reintento_red;
     }
     char err[512] = "";
-    if (probar_red && sple_filas(servidor, ids.data(), ids.size(), 0, static_cast<int64_t>(info.filas), out, err, sizeof err) == 0) {
+    if (probar_red && sple_filas(servidor.load(), ids.data(), ids.size(), 0, static_cast<int64_t>(info.filas), out, err, sizeof err) == 0) {
       pedidas_servidor += ids.size();
       std::lock_guard g(mx_modo);
       if (modo_disco) log("la red vuelve a responder tras {} s en modo disco ({} filas leídas del disco); se deja el disco",
@@ -236,8 +236,9 @@ int main(int argc, char** argv) {
   uint64_t filas = 16ull << 20;
   std::string fichero;
   int hilos_disco = 16, fallos_para_disco = 10, reintento_red = 30;
-  for (int i = 1; i + 1 < argc; i += 2) {
+  for (int i = 1; i < argc; i += 2) {
     std::string a = argv[i];
+    if (i + 1 >= argc) { std::fprintf(stderr, "falta el valor de %s\n", a.c_str()); return 2; }
     if (a == "--servidor") servidor = argv[i + 1];
     else if (a == "--socket") socket_ruta = argv[i + 1];
     else if (a == "--filas") filas = std::stoull(argv[i + 1]);
@@ -308,7 +309,16 @@ int main(int argc, char** argv) {
     });
     for (;;) {
       int c = ::accept4(s, nullptr, nullptr, SOCK_CLOEXEC);
-      if (c < 0) { if (errno == EINTR) continue; throw std::runtime_error(std::string("accept: ") + std::strerror(errno)); }
+      if (c < 0) {
+        // sin descriptores o memoria (EMFILE, ENFILE, ENOBUFS, ENOMEM) o conexión abortada: se espera y se sigue, no se cae el servicio
+        if (errno == EINTR || errno == ECONNABORTED) continue;
+        if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM) {
+          log("accept: {}; se reintenta en 100 ms", std::strerror(errno));
+          std::this_thread::sleep_for(std::chrono::milliseconds(100));
+          continue;
+        }
+        throw std::runtime_error(std::string("accept: ") + std::strerror(errno));
+      }
       std::thread([&ag, c] { ag.atender(c); }).detach();
     }
   } catch (const std::exception& e) {

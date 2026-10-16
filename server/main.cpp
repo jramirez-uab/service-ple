@@ -213,7 +213,16 @@ int main(int argc, char** argv) {
       sockaddr_in6 cli{};
       socklen_t l = sizeof cli;
       int c = ::accept4(s, reinterpret_cast<sockaddr*>(&cli), &l, SOCK_CLOEXEC);
-      if (c < 0) { if (errno == EINTR) continue; throw std::runtime_error(std::string("accept: ") + std::strerror(errno)); }
+      if (c < 0) {
+        // sin descriptores o memoria (EMFILE, ENFILE, ENOBUFS, ENOMEM) o conexión abortada: se espera y se sigue, no se cae el servicio
+        if (errno == EINTR || errno == ECONNABORTED) continue;
+        if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM) {
+          log("accept: {}; se reintenta en 100 ms", std::strerror(errno));
+          std::this_thread::sleep_for(std::chrono::milliseconds(100));
+          continue;
+        }
+        throw std::runtime_error(std::string("accept: ") + std::strerror(errno));
+      }
       char txt[INET6_ADDRSTRLEN] = "?";
       ::inet_ntop(AF_INET6, &cli.sin6_addr, txt, sizeof txt);
       std::string quien = sple::formato("{}:{}", txt, ntohs(cli.sin6_port));

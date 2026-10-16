@@ -62,14 +62,16 @@ struct Conexion {
   std::vector<uint8_t> filas;
   std::string error;
   // robustez
-  const int espera_ms = entero_env("SERVICE_PLE_ESPERA_MS", 2000);
-  const int conexion_ms = entero_env("SERVICE_PLE_CONEXION_MS", 300);
+  // al menos 1 ms: un timeval {0, 0} en SO_RCVTIMEO es «sin límite» y un servidor colgado pararía el motor para siempre
+  const int espera_ms = std::max(1, entero_env("SERVICE_PLE_ESPERA_MS", 2000));
+  const int conexion_ms = std::max(1, entero_env("SERVICE_PLE_CONEXION_MS", 300));
   const bool degradar = entero_env("SERVICE_PLE_DEGRADAR", 1) != 0;
   uint64_t huella0 = 0;  // la tabla del primer INFO: al reconectar, el servidor tiene que dar la misma
   bool caido = false;
   Reloj::time_point caido_desde{}, proximo_intento{}, ultimo_aviso{};
   uint64_t pasos_ceros = 0, filas_ceros = 0;
   bool agotado = false;  // el último fallo fue por tiempo (servidor colgado): no reintentar en el acto
+  Reloj::time_point proxima_cache{};  // sin caché del agente: se vuelve a buscar cada 30 s (el agente puede arrancar después que el motor)
 
   ~Conexion() { cerrar(); }
   void cerrar() { if (fd >= 0) ::close(fd); fd = -1; }
@@ -86,7 +88,7 @@ struct Conexion {
         if (!host.empty() && host.front() == '[') host = host.substr(1, host.size() - 2);
       }
       if (conectar_uno()) {
-        if (!cache) Cache::abrir(info.huella, cache);  // la del agente de esta máquina, si hay
+        if (!cache) abrir_cache();  // la del agente de esta máquina, si hay
         return true;
       }
       errores += (errores.empty() ? "" : "; ") + error;
@@ -95,9 +97,18 @@ struct Conexion {
     return false;
   }
 
+  void abrir_cache() {
+    proxima_cache = Reloj::now() + std::chrono::seconds(30);
+    // la caché se elige por la huella de la tabla; su ancho de fila tiene que ser el del servidor (leer() copia bytes_fila de la caché)
+    try {
+      if (Cache::abrir(info.huella, cache) && cache.cabecera().bytes_fila != info.bytes_fila) cache = Cache{};
+    } catch (const std::exception&) { cache = Cache{}; }  // mmap fallido: sin caché (no puede salir una excepción por la interfaz C)
+  }
+
   bool conectar_unix(const std::string& ruta) {
-    fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     sockaddr_un a{};
+    if (ruta.size() >= sizeof a.sun_path) { error = "ruta de socket demasiado larga (máximo " + std::to_string(sizeof a.sun_path - 1) + "): " + ruta; return false; }
+    fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     a.sun_family = AF_UNIX;
     std::snprintf(a.sun_path, sizeof a.sun_path, "%s", ruta.c_str());
     if (fd < 0 || ::connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof a) != 0) {
@@ -147,10 +158,16 @@ struct Conexion {
     ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &t, sizeof t);
     Cabecera c{MAGIA, VERSION, OP_INFO, 0, OK};
     Cabecera r{};
-    if (!enviar(&c, sizeof c) || !recibir(&r, sizeof r)) return false;
+    if (!enviar(&c, sizeof c) || !recibir(&r, sizeof r) || !cabecera_valida(r)) return false;
     if (r.estado != OK) { error = "el servidor rechaza INFO (estado " + std::to_string(r.estado) + ")"; cerrar(); return false; }
     Info nueva{};
     if (!recibir(&nueva, sizeof nueva)) return false;
+    // los ids viajan como uint32 y bytes_fila dimensiona los búferes: un INFO absurdo se rechaza en vez de reservar memoria con él
+    if (nueva.bytes_fila == 0 || nueva.bytes_fila > (1u << 20) || nueva.filas > (uint64_t{1} << 32)) {
+      error = "INFO no válido (" + std::to_string(nueva.filas) + " filas de " + std::to_string(nueva.bytes_fila) + " B)";
+      cerrar();
+      return false;
+    }
     if (huella0 && nueva.huella != huella0) {
       error = "el servidor sirve ahora otra tabla (huella distinta): no se usa";
       cerrar();
@@ -159,6 +176,13 @@ struct Conexion {
     info = nueva;
     huella0 = info.huella;
     return true;
+  }
+
+  bool cabecera_valida(const Cabecera& r) {
+    if (r.magia == MAGIA && r.version == VERSION) return true;
+    error = "respuesta que no es de service-ple (magia o versión distintas)";
+    cerrar();
+    return false;
   }
 
   // el paso sigue con ceros: avisos al caer y cada minuto
@@ -212,7 +236,7 @@ struct Conexion {
   bool pedir(const std::vector<uint32_t>& q, std::vector<uint8_t>& out) {
     Cabecera c{MAGIA, VERSION, OP_FILAS, static_cast<uint32_t>(q.size()), OK};
     Cabecera r{};
-    if (!enviar(&c, sizeof c) || !enviar(q.data(), q.size() * sizeof(uint32_t)) || !recibir(&r, sizeof r)) return false;
+    if (!enviar(&c, sizeof c) || !enviar(q.data(), q.size() * sizeof(uint32_t)) || !recibir(&r, sizeof r) || !cabecera_valida(r)) return false;
     if (r.estado == ERR_SIN_SERVIDOR) { error = "el agente local no tiene servidor ni disco para estas filas"; return false; }  // conexión sana
     if (r.estado != OK || r.n != q.size()) { error = "el servidor rechaza la petición (estado " + std::to_string(r.estado) + ")"; cerrar(); return false; }
     out.resize(q.size() * info.bytes_fila);
@@ -286,10 +310,12 @@ void* sple_abrir(const char* direccion, char* err, int errlen) {
   return c;
 }
 
+// No cerrar mientras quede trabajo encolado con sple_encolar ni grafos CUDA capturados que lo usen (guardan el manejador).
 void sple_cerrar(void* h) { delete static_cast<Conexion*>(h); }
 
 int sple_info(void* h, uint64_t* filas, uint32_t* bytes_fila, uint16_t* escala_bf16, uint64_t* huella) {
   auto* c = static_cast<Conexion*>(h);
+  std::lock_guard g(c->mx);  // una reconexión en otro hilo puede estar cambiando info
   *filas = c->info.filas;
   *bytes_fila = c->info.bytes_fila;
   *escala_bf16 = c->info.escala_bf16;
@@ -341,6 +367,7 @@ int sple_filas_impl(Conexion* c, const int64_t* ids, uint64_t n, int64_t lo, int
     if (ids[i] >= lo && ids[i] < hi) c->ids.push_back(static_cast<uint32_t>(ids[i]));
   std::ranges::sort(c->ids);
   c->ids.erase(std::unique(c->ids.begin(), c->ids.end()), c->ids.end());
+  if (!c->cache && Reloj::now() >= c->proxima_cache) c->abrir_cache();
   if (!c->ids.empty()) {
     // 1) caché compartida de la máquina (fase 2), sin salir del proceso
     c->filas.resize(c->ids.size() * bf);
@@ -378,7 +405,7 @@ int sple_filas_impl(Conexion* c, const int64_t* ids, uint64_t n, int64_t lo, int
   // elegidas por un hash del id (siempre las mismas, como una caché que nunca las tiene)
   static const double perdidas = [] { const char* e = std::getenv("SERVICE_PLE_PERDIDAS"); return e ? std::atof(e) : 0.0; }();
   // umbral sobre 2^64: con perdidas >= 1 se pierden todas (convertir 1,0 × 2^64 a uint64 no está definido)
-  const bool todas = perdidas >= 1.0;
+  const bool todas = perdidas * 18446744073709551616.0 >= 18446744073709551616.0;
   const uint64_t umbral = todas ? 0 : static_cast<uint64_t>(perdidas * 18446744073709551616.0);
   // SERVICE_PLE_RELLENO=anterior: una fila perdida se sustituye por la de la misma cabeza del token anterior (posición i − 16, y así hacia atrás
   // mientras también falte). Con TP la escribe la GPU dueña de esa otra fila, para que la suma entre GPU siga siendo exacta.

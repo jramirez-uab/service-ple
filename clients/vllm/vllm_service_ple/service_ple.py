@@ -111,7 +111,9 @@ def patch():
         if n == 0:
             return output
         lib, err = _lib(), ctypes.create_string_buffer(512)
-        if lib.sple_errores(err, len(err)) != _ESTADO.get("errores_vistos", 0):
+        errores = lib.sple_errores(err, len(err))
+        if errores != _ESTADO.get("errores_vistos", 0):
+            _ESTADO["errores_vistos"] = errores  # each failed request is reported once, not on every later step
             raise RuntimeError(f"service-ple: fallo en una petición encolada: {err.value.decode(errors='replace')}")
         st = getattr(self, "_sple_buf", None)
         if st is None or st[0].numel() < n:

@@ -35,7 +35,7 @@ struct Hueco {
   std::atomic<uint32_t> version;  // impar = escribiéndose
   std::atomic<uint8_t> uso;       // bit de uso para CLOCK
   uint8_t relleno[3];
-  uint64_t id;                    // id + 1 (0 = vacío)
+  alignas(8) uint64_t id;         // id + 1 (0 = vacío); se accede con std::atomic_ref
   uint8_t fila[MAX_BYTES_FILA];
 };
 static_assert(sizeof(Hueco) == 176);
@@ -72,6 +72,14 @@ class Cache {
       cab->magia = MAGIA_CACHE;
       k.reutilizada_ = false;
     } else {
+      // un agente anterior que murió a medio escribir deja huecos con versión impar: los lectores los saltarían siempre y el escritor,
+      // al reutilizarlos, pondría la versión en par mientras escribe. Se vacían (aquí no hay otro escritor).
+      for (uint64_t i = 0; i < c; ++i)
+        for (auto& h : k.conj_[i].h)
+          if (uint32_t v = h.version.load(std::memory_order_relaxed); v & 1u) {
+            std::atomic_ref<uint64_t>(h.id).store(0, std::memory_order_relaxed);
+            h.version.store(v + 1, std::memory_order_release);
+          }
       k.reutilizada_ = true;
     }
     return k;
@@ -85,8 +93,12 @@ class Cache {
     struct stat st{};
     if (::fstat(fd, &st) != 0 || static_cast<size_t>(st.st_size) < sizeof(CabeceraCache)) { ::close(fd); return false; }
     Cache k(fd, static_cast<size_t>(st.st_size));
-    if (k.cab_->magia != MAGIA_CACHE || k.cab_->huella != huella ||
-        sizeof(CabeceraCache) + k.cab_->conjuntos * sizeof(Conjunto) != static_cast<size_t>(st.st_size)) return false;
+    // la cabecera viene de un fichero de /dev/shm: se valida todo lo que luego da tamaños o índices
+    const auto& cab = *k.cab_;
+    const uint64_t c = cab.conjuntos;
+    if (cab.magia != MAGIA_CACHE || cab.huella != huella || cab.vias != VIAS || cab.bytes_fila == 0 || cab.bytes_fila > MAX_BYTES_FILA ||
+        c == 0 || (c & (c - 1)) != 0 || c > (static_cast<size_t>(st.st_size) - sizeof(CabeceraCache)) / sizeof(Conjunto) ||
+        sizeof(CabeceraCache) + c * sizeof(Conjunto) != static_cast<size_t>(st.st_size)) return false;
     out = std::move(k);
     return true;
   }
@@ -110,10 +122,10 @@ class Cache {
     for (auto& h : s.h) {
       uint32_t v1 = h.version.load(std::memory_order_acquire);
       if (v1 & 1u) continue;
-      if (h.id != id + 1) continue;
+      if (id_de(h) != id + 1) continue;
       std::memcpy(dst, h.fila, bf);
       std::atomic_thread_fence(std::memory_order_acquire);
-      if (h.version.load(std::memory_order_relaxed) != v1 || h.id != id + 1) return false;  // a medio cambiar: fallo
+      if (h.version.load(std::memory_order_relaxed) != v1 || id_de(h) != id + 1) return false;  // a medio cambiar: fallo
       h.uso.store(1, std::memory_order_relaxed);
       return true;
     }
@@ -124,9 +136,9 @@ class Cache {
   void escribir(uint64_t id, const uint8_t* src) {
     Conjunto& s = conj_[conjunto(id)];
     for (auto& h : s.h)
-      if (h.id == id + 1) { h.uso.store(1, std::memory_order_relaxed); return; }
+      if (id_de(h) == id + 1) { h.uso.store(1, std::memory_order_relaxed); return; }
     Hueco* v = nullptr;
-    for (auto& h : s.h) if (h.id == 0) { v = &h; break; }
+    for (auto& h : s.h) if (id_de(h) == 0) { v = &h; break; }
     while (!v) {
       uint32_t m = s.mano.load(std::memory_order_relaxed);
       Hueco& h = s.h[m % VIAS];
@@ -136,7 +148,7 @@ class Cache {
     uint32_t ver = v->version.load(std::memory_order_relaxed);
     v->version.store(ver + 1, std::memory_order_relaxed);  // impar: escribiéndose
     std::atomic_thread_fence(std::memory_order_release);
-    v->id = id + 1;
+    std::atomic_ref<uint64_t>(v->id).store(id + 1, std::memory_order_relaxed);
     std::memcpy(v->fila, src, cab_->bytes_fila);
     v->uso.store(1, std::memory_order_relaxed);
     v->version.store(ver + 2, std::memory_order_release);
@@ -152,6 +164,8 @@ class Cache {
     cab_ = reinterpret_cast<CabeceraCache*>(base_);
     conj_ = reinterpret_cast<Conjunto*>(base_ + sizeof(CabeceraCache));
   }
+  // id lo escribe el agente mientras los motores lo leen: atómico (relajado; el orden lo da la versión)
+  static uint64_t id_de(Hueco& h) { return std::atomic_ref<uint64_t>(h.id).load(std::memory_order_relaxed); }
   void cerrar() { if (base_) ::munmap(base_, tam_); base_ = nullptr; }
   uint64_t conjunto(uint64_t id) const { return (id * 0x9E3779B97F4A7C15ull >> 20) & (cab_->conjuntos - 1); }
 

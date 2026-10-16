@@ -2,7 +2,8 @@
 // Todo en little-endian (x86-64). Una petición = Cabecera [+ n ids uint32]; una respuesta = Cabecera [+ cuerpo].
 //   INFO  (op 1): respuesta Cabecera + Info.
 //   FILAS (op 2): petición con n ids globales (ordenados y sin repetir, recomendado); respuesta Cabecera(n) + n × bytes_fila,
-//                 en el mismo orden. Si estado != 0 no hay cuerpo y el servidor cierra la conexión.
+//                 en el mismo orden. Si estado != 0 no hay cuerpo y el servidor cierra la conexión, salvo ERR_SIN_SERVIDOR (solo lo da el
+//                 agente cuando no tiene de dónde sacar las filas): la conexión sigue abierta y el cliente sigue con ceros en ese paso.
 // Idempotencia: todas las operaciones son de solo lectura sobre una tabla que no cambia; repetir una petición da el mismo resultado y no cambia
 // nada en el servidor. Un cliente puede reintentar cualquier petición (por ejemplo, tras reconectar) sin riesgo.
 #pragma once

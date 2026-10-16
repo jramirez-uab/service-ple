@@ -22,6 +22,7 @@ struct Fd {  // descriptor que se cierra solo
 struct Lector {
   const std::string& s;
   size_t i = 0;
+  int profundidad = 0;  // la cabecera puede llegar a 64 MB: sin tope, "[[[[…" agotaría la pila
   void esp() { while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i]))) ++i; }
   [[noreturn]] void error(const char* q) { throw std::runtime_error(std::string("JSON: ") + q + " en la posición " + std::to_string(i)); }
   char ver() { esp(); if (i >= s.size()) error("fin inesperado"); return s[i]; }
@@ -37,6 +38,7 @@ struct Lector {
     return r;
   }
   Json valor() {
+    struct Nivel { int& p; explicit Nivel(Lector& l) : p(l.profundidad) { if (++p > 64) l.error("anidamiento excesivo"); } ~Nivel() { --p; } } nivel(*this);
     char c = ver();
     if (c == '{') {
       ++i; std::map<std::string, Json> m;
@@ -58,7 +60,9 @@ struct Lector {
     }
     if (c == '"') return {cadena()};
     if (c == '-' || std::isdigit(static_cast<unsigned char>(c))) {
-      size_t f; long long n = std::stoll(s.substr(i, 32), &f); i += f; return {n};
+      size_t f; long long n;
+      try { n = std::stoll(s.substr(i, 32), &f); } catch (const std::logic_error&) { error("número no válido"); }
+      i += f; return {n};
     }
     if (s.compare(i, 4, "null") == 0) { i += 4; return {nullptr}; }
     error("valor no admitido");
@@ -104,13 +108,16 @@ DescTabla leer_cabecera(const std::string& fichero) {
     const auto& off = o.at("data_offsets").lista();
     const auto& forma = o.at("shape").lista();
     int numero = numero_de_trozo(k);
+    // desplazamientos del fichero, que puede estar dañado: 0 <= inicio <= fin
+    if (off.size() != 2 || off[0].ent() < 0 || off[1].ent() < off[0].ent()) throw std::runtime_error("data_offsets no válidos: " + k);
     if (numero >= 0) {
       if (o.at("dtype").cad() != "F8_E4M3" || forma.size() != 2) throw std::runtime_error("trozo con formato inesperado: " + k);
+      if (forma[0].ent() <= 0 || forma[1].ent() <= 0 || forma[1].ent() > (1 << 20)) throw std::runtime_error("forma no válida: " + k);
       uint32_t bf = static_cast<uint32_t>(forma[1].ent());
       if (d.bytes_fila && d.bytes_fila != bf) throw std::runtime_error("trozos con anchos distintos");
       d.bytes_fila = bf;
       uint64_t filas = static_cast<uint64_t>(forma[0].ent());
-      if (static_cast<uint64_t>(off[1].ent() - off[0].ent()) != filas * bf) throw std::runtime_error("tamaño de trozo incoherente: " + k);
+      if (filas > UINT64_MAX / bf || static_cast<uint64_t>(off[1].ent() - off[0].ent()) != filas * bf) throw std::runtime_error("tamaño de trozo incoherente: " + k);
       d.trozos.push_back({numero, filas, d.inicio_datos + static_cast<uint64_t>(off[0].ent())});
     } else if (k.ends_with("weight_scale")) {
       if (o.at("dtype").cad() != "BF16") throw std::runtime_error("escala no BF16");
