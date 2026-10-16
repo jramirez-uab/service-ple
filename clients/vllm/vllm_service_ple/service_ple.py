@@ -84,6 +84,14 @@ def patch():
     except Exception:
         return
     log = init_logger(__name__)
+    try:
+        import vllm
+        # sin _direccion(): al registrar el plugin vLLM aún no tiene su configuración y se guardaría una dirección vacía
+        if not str(getattr(vllm, "__version__", "")).startswith("0.31"):
+            log.warning("service-ple: probado solo con vLLM 0.31 (esta es %s); toca partes internas que pueden haber cambiado",
+                        getattr(vllm, "__version__", "?"))
+    except Exception:
+        pass
     cls = ne.Qwen4ExpPLEPinnedHostEmbedding
     if getattr(cls, "_service_ple_parcheado", False):
         return

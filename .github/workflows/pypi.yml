@@ -1,0 +1,63 @@
+# vllm-service-ple on PyPI: the wheel (manylinux, with libserviceple.so built by CMake) and the sdist.
+# A published GitHub release goes to PyPI; a manual run (Actions → pypi → Run workflow) goes to TestPyPI.
+# Trusted publishing (OIDC): no tokens in the repository; PyPI and TestPyPI must list this repository, this workflow file and the
+# environment ("pypi" / "testpypi") as a trusted publisher of the project.
+name: pypi
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  wheel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pypa/cibuildwheel@v2.23.3   # settings in pyproject.toml ([tool.cibuildwheel])
+        with:
+          output-dir: dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel
+          path: dist/*.whl
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: pipx run build --sdist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  pypi:
+    if: github.event_name == 'release'
+    needs: [wheel, sdist]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  testpypi:
+    if: github.event_name == 'workflow_dispatch'
+    needs: [wheel, sdist]
+    runs-on: ubuntu-latest
+    environment: testpypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/

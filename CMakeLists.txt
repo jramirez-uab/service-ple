@@ -23,6 +23,12 @@ add_library(serviceple SHARED lib/cliente.cpp)
 target_include_directories(serviceple PUBLIC lib)
 target_link_libraries(serviceple PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
 
+# Python wheel (pyproject.toml, scikit-build-core): only the client library, inside the vllm_service_ple package
+if(SKBUILD)
+  install(TARGETS serviceple LIBRARY DESTINATION vllm_service_ple)
+  return()
+endif()
+
 add_executable(service-ple-server server/main.cpp)
 target_link_libraries(service-ple-server PRIVATE sple_tabla Threads::Threads)
 
