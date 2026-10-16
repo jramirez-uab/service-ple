@@ -10,8 +10,9 @@
 # ROOT=/some/dir installs under that root and skips systemctl/nft (for tests).
 set -euo pipefail
 
-usage() { sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit ${1:-2}; }
 [ $# -ge 1 ] || usage
+if [ "${1:-}" = --help ] || [ "${1:-}" = -h ]; then usage 0; fi
 MODE=$1; shift
 SRC=$(cd "$(dirname "$0")/.." && pwd)
 ROOT=${ROOT:-}

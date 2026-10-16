@@ -58,6 +58,8 @@ void resto(std::string& out, const char* f, A&& a, R&&... r) {
       while (*fin && *fin != '}') ++fin;
       std::string spec(f + 1, fin);
       if (!spec.empty() && spec[0] == ':') spec.erase(0, 1);
+      if (!spec.empty() && spec[0] == '>') spec.erase(0, 1);
+      else if (!spec.empty() && spec[0] == '<') { spec.erase(0, 1); spec.insert(0, "-"); }
       uno(out, spec, std::forward<A>(a));
       return resto(out, *fin ? fin + 1 : fin, std::forward<R>(r)...);
     }
