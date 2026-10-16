@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vllm-service-ple"
-version = "0.1.0"
+version = "0.2.0"
 description = "vLLM plugin: serve the Flash-Next PLE table from service-ple (network server + local agent) instead of pinning 64 GiB of host RAM"
 requires-python = ">=3.10"
 
