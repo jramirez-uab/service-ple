@@ -23,8 +23,10 @@ add_library(serviceple SHARED lib/cliente.cpp)
 target_include_directories(serviceple PUBLIC lib)
 target_link_libraries(serviceple PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
 
-# Python wheel (pyproject.toml, scikit-build-core): only the client library, inside the vllm_service_ple package
-if(SKBUILD)
+# Python wheels (scikit-build-core). SPLE_WHEEL=plugin (pyproject.toml at the root): only the client library, inside the vllm_service_ple
+# package. SPLE_WHEEL=servicios (packaging/service-ple): the server, the agent and the installer as commands (see the end of this file).
+set(SPLE_WHEEL "plugin" CACHE STRING "which wheel scikit-build-core is building")
+if(SKBUILD AND SPLE_WHEEL STREQUAL "plugin")
   install(TARGETS serviceple LIBRARY DESTINATION vllm_service_ple)
   return()
 endif()
@@ -45,5 +47,12 @@ add_executable(service-ple-carga bench/carga.cpp)
 target_link_libraries(service-ple-carga PRIVATE serviceple Threads::Threads)
 add_executable(service-ple-lecturas bench/lecturas.cpp)
 target_link_libraries(service-ple-lecturas PRIVATE Threads::Threads)
+
+if(SKBUILD)
+  # native executables in the environment's bin/ (wheel .data/scripts: no Python wrapper); the installer finds them next to itself
+  install(TARGETS service-ple-server service-ple-agent service-ple-lecturas RUNTIME DESTINATION ${SKBUILD_SCRIPTS_DIR})
+  install(PROGRAMS deploy/install.sh DESTINATION ${SKBUILD_SCRIPTS_DIR} RENAME service-ple-install)
+  return()
+endif()
 
 install(TARGETS service-ple-server service-ple-agent serviceple)

@@ -94,8 +94,12 @@ deploy/install.sh agent  --server SERVER_HOST:18460                             
 deploy/install.sh agent  --server SERVER_HOST:18460 --table /local/copy/ple-fp8.safetensors      # modes 2.2 + 2.1: server, local file as fallback
 deploy/install.sh plugin --python /path/to/vllm-venv/bin/python                                  # each vLLM environment
 ```
-The plugin is also on PyPI: `pip install vllm-service-ple` in the vLLM 0.31 environment (wheel with the client library inside;
-https://pypi.org/project/vllm-service-ple/). The agent and the server are installed from this repository.
+Without building, from PyPI (x86-64 Linux, glibc ≥ 2.24):
+```
+uv tool install service-ple                                                    # server, agent, installer (or: pipx install service-ple)
+sudo "$(command -v service-ple-install)" agent --table /xfs/ple-fp8.safetensors   # same options as deploy/install.sh
+pip install vllm-service-ple                                                   # in the vLLM 0.31 environment: plugin + client library
+```
 The engine then uses `unix:/run/service-ple/agente.sock` (mode 2) or `HOST:18460` (straight to a server). The client waits up to 30 s for
 the local agent (`SERVICE_PLE_ESPERA_LOCAL_MS`) and 2 s for a server (`SERVICE_PLE_ESPERA_MS`); only one agent per table runs on a machine.
 Each run compares what is installed with what it would install, replaces only what differs (atomically), restarts only what uses a

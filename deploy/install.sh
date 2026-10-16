@@ -6,6 +6,7 @@
 #   install.sh server --table /path/ple-fp8.safetensors [--port 18460] [--allow "192.0.2.10 192.0.2.11"]
 #   install.sh agent  [--server HOST:18460] [--table /path/ple-fp8.safetensors] [--rows 16777216]
 #   install.sh plugin --python /path/to/venv/bin/python
+# From PyPI, without the repository: `uv tool install service-ple` (or pipx), then `sudo "$(command -v service-ple-install)" agent ...`.
 # Common options: -n (dry run: report what would change), --no-restart (install but leave the restart pending), --build DIR.
 # ROOT=/some/dir installs under that root and skips systemctl/nft (for tests).
 set -euo pipefail
@@ -15,8 +16,10 @@ usage() { sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit ${1:-2}; }
 if [ "${1:-}" = --help ] || [ "${1:-}" = -h ]; then usage 0; fi
 MODE=$1; shift
 SRC=$(cd "$(dirname "$0")/.." && pwd)
+# installed from PyPI (`pip install service-ple`, this file as bin/service-ple-install): the binaries are already built, next to it
+PREBUILT=""; [ -x "$(dirname "$0")/service-ple-agent" ] && [ ! -f "$SRC/CMakeLists.txt" ] && PREBUILT=$(cd "$(dirname "$0")" && pwd)
 ROOT=${ROOT:-}
-DRY=0 RESTART=1 BUILD=$SRC/build
+DRY=0 RESTART=1 BUILD=${PREBUILT:-$SRC/build}
 TABLE="" PORT=18460 ALLOW="" SERVER="" ROWS=16777216 PY=""
 while [ $# -gt 0 ]; do
   case $1 in
@@ -62,6 +65,7 @@ put_text() {
 }
 
 build() {
+  [ -n "$PREBUILT" ] && return 0
   cmake -S "$SRC" -B "$BUILD" -DCMAKE_BUILD_TYPE=RelWithDebInfo >/dev/null
   cmake --build "$BUILD" -j"$(nproc)" >/dev/null
 }
@@ -136,8 +140,11 @@ E
     build
     bin=0 unit=0
     put_file "$BUILD/service-ple-agent" /usr/local/bin/service-ple-agent 755 && bin=1
-    [ -f "$BUILD/libserviceple.so" ] || { echo "agent: $BUILD/libserviceple.so was not built" >&2; exit 1; }
-    put_file "$BUILD/libserviceple.so" /usr/local/lib/libserviceple.so 644 || true
+    # the client library for C++ engines (vLLM gets its own copy from the vllm-service-ple package); not in the PyPI package
+    if [ -z "$PREBUILT" ]; then
+      [ -f "$BUILD/libserviceple.so" ] || { echo "agent: $BUILD/libserviceple.so was not built" >&2; exit 1; }
+      put_file "$BUILD/libserviceple.so" /usr/local/lib/libserviceple.so 644 || true
+    fi
     args="--socket /run/service-ple/agente.sock --filas $ROWS"
     [ -n "$SERVER" ] && args="--servidor $SERVER $args"
     [ -n "$TABLE" ] && args="$args --fichero $TABLE"
@@ -162,6 +169,7 @@ E
     ;;
   plugin)
     [ -n "$PY" ] || { echo "plugin: --python is required" >&2; exit 2; }
+    [ -z "$PREBUILT" ] || { echo "plugin: from PyPI, run: $PY -m pip install vllm-service-ple (or uv pip install --python $PY vllm-service-ple)" >&2; exit 2; }
     build
     site=$("$PY" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')
     # the package (with the library inside) is installed only if its content hash differs from the installed one

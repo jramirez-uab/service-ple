@@ -1,0 +1,49 @@
+# PyPI package "service-ple": the server, the agent and the installer as native commands (no Python code). The vLLM plugin is the other
+# package (vllm-service-ple, pyproject.toml at the repository root). Version: clients/vllm/pyproject.toml, the same for both.
+#   uv tool install service-ple        # or: pipx install service-ple
+#   sudo "$(command -v service-ple-install)" agent --table /xfs/ple-fp8.safetensors
+[build-system]
+requires = ["scikit-build-core>=0.10"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "service-ple"
+dynamic = ["version"]
+description = "service-ple server and agent (C++): the Flash-Next PLE table out of the inference engines, from a local file and/or a central server"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Jorge Ramírez Espejo" }]
+requires-python = ">=3.8"
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: No Input/Output (Daemon)",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: C++",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: System :: Systems Administration",
+]
+
+[project.urls]
+Homepage = "https://github.com/jramirez-uab/service-ple"
+Issues = "https://github.com/jramirez-uab/service-ple/issues"
+
+[tool.scikit-build]
+minimum-version = "build-system.requires"
+cmake.source-dir = "../.."
+cmake.build-type = "Release"
+cmake.define.SPLE_WHEEL = "servicios"
+build-dir = "../../build/wheel-servicios"
+build.targets = ["service-ple-server", "service-ple-agent", "service-ple-lecturas"]
+wheel.packages = []
+wheel.py-api = "py3"
+
+[tool.scikit-build.metadata.version]
+provider = "scikit_build_core.metadata.regex"
+input = "../../clients/vllm/pyproject.toml"
+regex = '(?m)^version = "(?P<value>[^"]+)"'
+
+[tool.cibuildwheel]
+build = "cp312-manylinux_x86_64"
+manylinux-x86_64-image = "manylinux_2_28"
+test-command = "service-ple-agent --filas abc; test $? = 2 && service-ple-server --puerto abc; test $? = 2 && service-ple-install -h"
