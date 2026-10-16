@@ -17,6 +17,10 @@ $P --servidor "unix:$T/b.sock" | tail -1
 $B/service-ple-carga "unix:$T/b.sock" 16 256 4 > $T/carga.out 2>&1 & L=$!
 v=$($P --servidor "unix:$T/b.sock" | tail -1); wait $L || true
 [ "$v" = "RESULTADO: OK" ] && grep -q "errores 0$" $T/carga.out && echo "RESULTADO: OK" || echo "RESULTADO: FALLO (agente solo con carga: $v; $(cat $T/carga.out))"
+# a local agent that takes longer than the server wait (2 s; here stopped for 3 s mid-load) is waited for: no request fails or goes with zeros
+SERVICE_PLE_DEGRADAR=0 $B/service-ple-carga "unix:$T/b.sock" 1 256 6 > $T/lento.out 2>&1 & L=$!
+sleep 2; kill -STOP $AB; sleep 3; kill -CONT $AB; wait $L || true
+grep -q "errores 0$" $T/lento.out && echo "RESULTADO: OK" || echo "RESULTADO: FALLO (agente lento: $(cat $T/lento.out))"
 # one agent per cache: a second agent on the same table (other --filas) must refuse to start and leave the first one's cache alone
 r=0; timeout 10 $B/service-ple-agent --socket $T/b2.sock --filas 4096 --fichero $T/t.safetensors > $T/b2.log 2>&1 || r=$?
 v=$($P --servidor "unix:$T/b.sock" | tail -1)

@@ -3,7 +3,9 @@
 // Las posiciones fuera de rango se rellenan con ceros (así funciona el reparto por vocabulario con TP: cada rango tiene un dueño).
 // Robustez (2026-10-15): si el servidor no responde, el paso sigue con ceros (perder hasta un 5 % de filas sube la NLL un 0,1 %; sin PLE,
 // un 3 %), reconecta solo y avisa en stderr al caer, cada minuto mientras dura y al volver. Variables: SERVICE_PLE_ESPERA_MS (espera máxima
-// de una respuesta, 2000), SERVICE_PLE_CONEXION_MS (espera máxima al conectar, 300), SERVICE_PLE_DEGRADAR=0 (fallar en vez de ceros).
+// de una respuesta del servidor, 2000), SERVICE_PLE_ESPERA_LOCAL_MS (la del agente local, 30000: lee del disco las filas que no tiene, y una
+// petición grande con un disco lento pasa de 2 s; con 2 s esas filas iban con ceros), SERVICE_PLE_CONEXION_MS (espera máxima al conectar,
+// 300), SERVICE_PLE_DEGRADAR=0 (fallar en vez de ceros).
 #include <dlfcn.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -77,6 +79,8 @@ struct Conexion {
   // al menos 1 ms: un timeval {0, 0} en SO_RCVTIMEO es «sin límite» y un servidor colgado pararía el motor para siempre
   // cada espera, como mucho 10 min: así 2 × espera_ms (tope total de un envío o una respuesta) no desborda
   const int espera_ms = entero_env("SERVICE_PLE_ESPERA_MS", 2000, 1);
+  const int espera_local_ms = entero_env("SERVICE_PLE_ESPERA_LOCAL_MS", 30000, 1);
+  int espera() const { return host.starts_with("unix:") ? espera_local_ms : espera_ms; }  // la del destino en uso
   const int conexion_ms = entero_env("SERVICE_PLE_CONEXION_MS", 300, 1);
   const bool degradar = entero_env("SERVICE_PLE_DEGRADAR", 1) != 0;
   uint64_t huella0 = 0;  // la tabla del primer INFO: al reconectar, el servidor tiene que dar la misma
@@ -190,7 +194,8 @@ struct Conexion {
   }
 
   bool tras_conectar() {
-    timeval t{espera_ms / 1000, (espera_ms % 1000) * 1000};  // un servidor colgado no debe parar el motor más de espera_ms
+    const int ms = espera();
+    timeval t{ms / 1000, (ms % 1000) * 1000};  // un servidor colgado no debe parar el motor más de la espera
     ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &t, sizeof t);
     ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &t, sizeof t);
     Cabecera c{MAGIA, VERSION, OP_INFO, 0, OK};
@@ -247,8 +252,8 @@ struct Conexion {
 
   bool enviar(const void* b, size_t n) {
     auto* p = static_cast<const uint8_t*>(b);
-    // SO_SNDTIMEO vale para cada send: un servidor que lee muy despacio alargaría el envío sin fin. Tope del total: 2 × espera_ms
-    const auto limite = Reloj::now() + std::chrono::milliseconds(2 * espera_ms);
+    // SO_SNDTIMEO vale para cada send: un servidor que lee muy despacio alargaría el envío sin fin. Tope del total: 2 × espera()
+    const auto limite = Reloj::now() + std::chrono::milliseconds(2 * espera());
     while (n) {
       ssize_t r = Reloj::now() > limite ? (errno = EAGAIN, -1) : ::send(fd, p, n, MSG_NOSIGNAL);
       if (r <= 0) {
@@ -263,13 +268,13 @@ struct Conexion {
   }
   bool recibir(void* b, size_t n) {
     auto* p = static_cast<uint8_t*>(b);
-    // SO_RCVTIMEO vale para cada recv: un servidor que manda un byte de vez en cuando lo alargaría sin fin. Tope del total: 2 × espera_ms
-    const auto limite = Reloj::now() + std::chrono::milliseconds(2 * espera_ms);
+    // SO_RCVTIMEO vale para cada recv: un servidor que manda un byte de vez en cuando lo alargaría sin fin. Tope del total: 2 × espera()
+    const auto limite = Reloj::now() + std::chrono::milliseconds(2 * espera());
     while (n) {
       ssize_t r = Reloj::now() > limite ? (errno = EAGAIN, -1) : ::recv(fd, p, n, 0);
       if (r <= 0) {
         agotado = r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
-        error = r == 0 ? "el servidor cerró la conexión" : agotado ? "sin respuesta en " + std::to_string(espera_ms) + " ms" : std::string("recepción: ") + std::strerror(errno);
+        error = r == 0 ? "el servidor cerró la conexión" : agotado ? "sin respuesta en " + std::to_string(espera()) + " ms" : std::string("recepción: ") + std::strerror(errno);
         cerrar();
         return false;
       }
