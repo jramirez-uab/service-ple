@@ -4,11 +4,14 @@
 // solo lectura), así que no hay problema de coherencia: como mucho, un lector ve el hueco a medio escribir y lo trata como fallo.
 #pragma once
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include <atomic>
+#include <cerrno>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
@@ -46,7 +49,11 @@ struct Conjunto {
   uint8_t relleno[60];
 };
 
-inline std::string ruta_cache(uint64_t huella) { return formato("/dev/shm/service-ple-{:016x}", huella); }
+// SERVICE_PLE_DIR_CACHE: otro directorio (p. ej. para medir con un agente aparte sin tocar la caché del agente de la máquina); por defecto /dev/shm
+inline std::string ruta_cache(uint64_t huella) {
+  const char* d = std::getenv("SERVICE_PLE_DIR_CACHE");
+  return formato("{}/service-ple-{:016x}", d && *d ? d : "/dev/shm", huella);
+}
 
 class Cache {
  public:
@@ -57,6 +64,16 @@ class Cache {
     uint64_t c = 1;
     while (c * VIAS < filas) c <<= 1;
     std::string ruta = ruta_cache(huella);
+    // un solo agente por caché: un segundo la sustituiría (otro --filas; los motores se irían a una caché sin escritor) o escribiría a la
+    // vez que el primero (mismo tamaño; el seqlock admite un solo escritor). El cerrojo dura lo que el agente (lo suelta el núcleo al morir)
+    int cerrojo = ::open((ruta + ".cerrojo").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0660);
+    if (cerrojo < 0) throw std::runtime_error("no se puede crear " + ruta + ".cerrojo");
+    if (::flock(cerrojo, LOCK_EX | LOCK_NB) != 0) {
+      const int e = errno;
+      ::close(cerrojo);
+      throw std::runtime_error(e == EWOULDBLOCK ? "otro agente usa ya la caché de esta tabla en esta máquina (" + ruta + ")" : "flock " + ruta + ".cerrojo");
+    }
+    struct Guarda { int& fd; ~Guarda() { if (fd >= 0) ::close(fd); } } guarda{cerrojo};  // si algo de abajo lanza, se suelta
     size_t tam = sizeof(CabeceraCache) + c * sizeof(Conjunto);
     // de otro tamaño (otro --filas): fichero nuevo, nunca ftruncate del que tienen mapeado los motores (con uno más pequeño, SIGBUS);
     // los motores siguen con el antiguo, que sigue siendo correcto (filas que no cambian), hasta que ven el nuevo (vigente())
@@ -91,6 +108,7 @@ class Cache {
       k.reutilizada_ = true;
     }
     k.conjuntos_ = c; k.bf_ = bytes_fila; k.huella_ = huella;
+    k.cerrojo_ = cerrojo; cerrojo = -1;
     return k;
   }
 
@@ -120,8 +138,8 @@ class Cache {
     if (this != &o) {
       cerrar();
       base_ = o.base_; tam_ = o.tam_; cab_ = o.cab_; conj_ = o.conj_; reutilizada_ = o.reutilizada_;
-      conjuntos_ = o.conjuntos_; bf_ = o.bf_; huella_ = o.huella_; ino_ = o.ino_;
-      o.base_ = nullptr;
+      conjuntos_ = o.conjuntos_; bf_ = o.bf_; huella_ = o.huella_; ino_ = o.ino_; cerrojo_ = o.cerrojo_;
+      o.base_ = nullptr; o.cerrojo_ = -1;
     }
     return *this;
   }
@@ -190,7 +208,7 @@ class Cache {
   }
   // id lo escribe el agente mientras los motores lo leen: atómico (relajado; el orden lo da la versión)
   static uint64_t id_de(Hueco& h) { return std::atomic_ref<uint64_t>(h.id).load(std::memory_order_relaxed); }
-  void cerrar() { if (base_) ::munmap(base_, tam_); base_ = nullptr; }
+  void cerrar() { if (base_) ::munmap(base_, tam_); base_ = nullptr; if (cerrojo_ >= 0) ::close(cerrojo_); cerrojo_ = -1; }
   uint64_t conjunto(uint64_t id) const { return (id * 0x9E3779B97F4A7C15ull >> 20) & (conjuntos_ - 1); }
 
   uint8_t* base_ = nullptr;
@@ -201,6 +219,7 @@ class Cache {
   uint64_t conjuntos_ = 0, huella_ = 0;
   uint32_t bf_ = 0;
   ino_t ino_ = 0;
+  int cerrojo_ = -1;  // solo en la del agente (crear)
 };
 
 }  // namespace sple

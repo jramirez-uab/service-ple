@@ -5,6 +5,7 @@
 set -eu
 F=$1; B=${2:-build}; T=$(mktemp -d)
 trap 'kill $(jobs -p) 2>/dev/null; rm -rf $T' EXIT
+export SERVICE_PLE_DIR_CACHE=$T  # its own cache: the agent of this machine (if any) keeps its own
 $B/service-ple-lecturas "$F" 64 5 1
 $B/service-ple-agent --socket $T/a.sock --filas 1024 --fichero "$F" > $T/a.log 2>&1 &
 for _ in $(seq 60); do [ -S $T/a.sock ] && break; sleep 1; done
