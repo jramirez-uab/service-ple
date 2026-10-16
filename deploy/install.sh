@@ -170,7 +170,13 @@ E
     have=$(cat "$ROOT$site/vllm_service_ple/.content-hash" 2>/dev/null || true)
     if [ "$want" != "$have" ]; then
       if [ $DRY = 0 ]; then
-        "$PY" -m pip install -q --no-deps --no-build-isolation ${ROOT:+--root "$ROOT"} "$stage"
+        if "$PY" -m pip --version >/dev/null 2>&1; then
+          "$PY" -m pip install -q --no-deps --no-build-isolation ${ROOT:+--root "$ROOT"} "$stage"
+        elif command -v uv >/dev/null && [ -z "$ROOT" ]; then   # venv made with uv: no pip inside
+          uv pip install -q --python "$PY" --no-deps --reinstall "$stage"
+        else
+          echo "plugin: $PY has no pip (and uv is missing, or ROOT is set)" >&2; exit 1
+        fi
         echo "$want" > "$ROOT$site/vllm_service_ple/.content-hash"   # marker of what is installed (pip does not copy it)
       fi
       note "plugin vllm-service-ple in $site ($want)"
