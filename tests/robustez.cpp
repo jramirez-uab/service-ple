@@ -2,6 +2,7 @@
 // Uso: service-ple-test-robustez DIRECTORIO_TEMPORAL
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -13,14 +14,17 @@
 #include <fstream>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "cache.hpp"
+#include "formato.hpp"
 #include "protocolo.hpp"
 #include "tabla.hpp"
 
 extern "C" {
 void* sple_abrir(const char*, char*, int);
 void sple_cerrar(void*);
+int sple_filas(void*, const int64_t*, uint64_t, int64_t, int64_t, uint8_t*, char*, int);
 }
 
 using namespace sple;
@@ -56,6 +60,18 @@ static int servidor_falso(int que, int& puerto) {
     int c = ::accept(s, nullptr, nullptr);
     char b[64];
     if (::recv(c, b, sizeof b, 0) > 0 && que == 1) { std::memset(b, 0x41, sizeof b); ::send(c, b, sizeof b, 0); }
+    if (que == 3) {  // contesta bien a INFO y luego lee muy despacio (1 KB cada 300 ms, 10 s): el envío de una petición grande se eterniza
+      Cabecera r{MAGIA, VERSION, OP_INFO, 0, OK};
+      Info i{uint64_t{1} << 21, 160, 0, 0, 1};
+      ::send(c, &r, sizeof r, MSG_NOSIGNAL); ::send(c, &i, sizeof i, MSG_NOSIGNAL);
+      std::vector<char> m(1024);
+      for (int k = 0; k < 33 && ::recv(c, m.data(), m.size(), 0) > 0; ++k) std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    }
+    if (que == 4) {  // contesta bien a INFO (tabla de 16 M filas) y luego no contesta
+      Cabecera r{MAGIA, VERSION, OP_INFO, 0, OK};
+      Info i{uint64_t{1} << 24, 160, 0, 0, 1};
+      ::send(c, &r, sizeof r, MSG_NOSIGNAL); ::send(c, &i, sizeof i, MSG_NOSIGNAL);
+    }
     if (que == 2)  // goteo: un byte cada 300 ms, siempre dentro de la espera de cada recv
       for (int k = 0; k < 40 && ::send(c, b, 1, MSG_NOSIGNAL) == 1; ++k) std::this_thread::sleep_for(std::chrono::milliseconds(300));
     std::this_thread::sleep_for(std::chrono::seconds(3));
@@ -137,6 +153,9 @@ int main(int argc, char** argv) {
   comprobar(rechaza(t), "tabla: rechaza data_offsets negativos (antes desplazamiento enorme)");
   escribir_safetensors(t, "{" + escala + R"(, "x.shard_0.weight": {"dtype": "F8_E4M3", "shape": [0, 160], "data_offsets": [2, 2]}})");
   comprobar(rechaza(t), "tabla: rechaza un trozo de 0 filas (antes división por cero en el agente)");
+  escribir_safetensors(t, R"({"x.weight_scale": {"dtype": "BF16", "shape": [0], "data_offsets": [0, 0]}, "x.shard_0.weight": {"dtype": "F8_E4M3", "shape": [1, 160], "data_offsets": [2, 162]}})");
+  comprobar(rechaza(t), "tabla: rechaza una escala que no ocupa 2 bytes (antes leía los 2 primeros bytes del trozo 0)");
+  comprobar(formato("{:d} {:05d} {:u} {:x}", 42ll, 7, 3000000000ull, 255) == "42 00007 3000000000 ff", "formato: {:d}, {:05d} y {:u} (antes \"%dlld\")");
   escribir_safetensors(t, "{" + escala + R"(, "y": {"dtype": "BF16", "shape": [-], "data_offsets": [0, 2]}})");
   comprobar(rechaza(t), "tabla: un número no válido da error");
   escribir_safetensors(t, "{" + escala + R"(, "x.shard_0.weight": {"dtype": "F8_E4M3", "shape": [1, 160], "data_offsets": [2, 162]}} basura)");
@@ -156,12 +175,19 @@ int main(int argc, char** argv) {
   std::string larga = "unix:/" + std::string(200, 'x');
   comprobar(!sple_abrir(larga.c_str(), e, sizeof e) && std::strstr(e, "demasiado larga"), "cliente: ruta de socket demasiado larga, con su error");
   int puerto = 0;
-  ::setenv("SERVICE_PLE_ESPERA_MS", "0", 1);
-  int s = servidor_falso(0, puerto);
+  // valores no válidos (0 era «sin límite»; «abc» daba 0 con atoi; uno enorme desbordaba 2 × espera): se usa el de defecto, 2 s por recv
+  int s = -1;
+  void* h = nullptr;
+  double seg = 0;
   auto t0 = std::chrono::steady_clock::now();
-  void* h = sple_abrir(("127.0.0.1:" + std::to_string(puerto)).c_str(), e, sizeof e);
-  double seg = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-  comprobar(!h && seg < 1.0, "cliente: SERVICE_PLE_ESPERA_MS=0 no deja colgado ante un servidor mudo (antes, sin límite)");
+  for (const char* v : {"0", "abc", "4000000000"}) {
+    ::setenv("SERVICE_PLE_ESPERA_MS", v, 1);
+    s = servidor_falso(0, puerto);
+    t0 = std::chrono::steady_clock::now();
+    h = sple_abrir(("127.0.0.1:" + std::to_string(puerto)).c_str(), e, sizeof e);
+    seg = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    comprobar(!h && seg > 1.5 && seg < 5.0, (std::string("cliente: SERVICE_PLE_ESPERA_MS=") + v + " usa la espera por defecto ante un servidor mudo").c_str());
+  }
   ::unsetenv("SERVICE_PLE_ESPERA_MS");
   (void)s;
   servidor_falso(1, puerto);
@@ -176,6 +202,48 @@ int main(int argc, char** argv) {
   comprobar(!h && seg < 3.0, "cliente: un servidor que gotea bytes no lo para más de 2 × espera (antes, 12 s o más)");
   ::unsetenv("SERVICE_PLE_ESPERA_MS");
   if (h) sple_cerrar(h);
+  ::setenv("SERVICE_PLE_ESPERA_MS", "800", 1);
+  servidor_falso(3, puerto);
+  h = sple_abrir(("127.0.0.1:" + std::to_string(puerto)).c_str(), e, sizeof e);
+  {
+    std::vector<int64_t> ids(1 << 20);
+    for (size_t k = 0; k < ids.size(); ++k) ids[k] = static_cast<int64_t>(k);
+    std::vector<uint8_t> out(ids.size() * 160);
+    t0 = std::chrono::steady_clock::now();
+    if (h) sple_filas(h, ids.data(), ids.size(), 0, int64_t{1} << 21, out.data(), e, sizeof e);
+    seg = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  }
+  comprobar(h && seg < 3.0, "cliente: un servidor que lee muy despacio no alarga el envío más de 2 × espera (antes, mientras leyera)");
+  ::unsetenv("SERVICE_PLE_ESPERA_MS");
+  if (h) sple_cerrar(h);
+
+#ifndef __SANITIZE_ADDRESS__  // ASan reserva terabytes de memoria virtual: RLIMIT_AS no sirve con él
+  {
+    // sin memoria dentro de sple_filas (búfer de 1 M filas × 160 B con un límite de memoria virtual): error, no std::terminate del motor
+    servidor_falso(4, puerto);
+    void* hm = sple_abrir(("127.0.0.1:" + std::to_string(puerto)).c_str(), e, sizeof e);
+    std::vector<int64_t> ids(1 << 20);
+    for (size_t k = 0; k < ids.size(); ++k) ids[k] = static_cast<int64_t>(k);
+    std::vector<uint8_t> out(ids.size() * 160);
+    pid_t p = ::fork();
+    if (p == 0) {
+      rlimit rl{};
+      ::getrlimit(RLIMIT_AS, &rl);
+      std::ifstream st("/proc/self/statm");
+      size_t paginas = 0;
+      st >> paginas;
+      rl.rlim_cur = paginas * 4096 + (64u << 20);  // 64 MB más de lo que ya usa: no caben 160 MB
+      ::setrlimit(RLIMIT_AS, &rl);
+      char ee[512] = "";
+      int r = hm ? sple_filas(hm, ids.data(), ids.size(), 0, int64_t{1} << 24, out.data(), ee, sizeof ee) : 0;
+      ::_exit(r == -1 && std::strstr(ee, "error interno") ? 0 : 1);
+    }
+    int estado = 0;
+    ::waitpid(p, &estado, 0);
+    comprobar(hm && WIFEXITED(estado) && WEXITSTATUS(estado) == 0, "cliente: sin memoria en sple_filas da error (antes std::terminate del motor)");
+    if (hm) sple_cerrar(hm);
+  }
+#endif
 
   // la última: con el código anterior revienta la pila
   escribir_safetensors(t, "{\"a\": " + std::string(100000, '[') + "}");

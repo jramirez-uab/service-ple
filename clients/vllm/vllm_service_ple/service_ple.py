@@ -107,6 +107,7 @@ def patch():
         if not getattr(self, "_sple_remoto", False):
             return orig_lookup(self, input_ids, output)
         dim = self.embedding_dim
+        bf = _ESTADO["bytes_fila"]  # bytes that the library writes per row (checked = dim × element size in allocate_embedding_weight)
         if output is None:
             output = torch.empty((*input_ids.shape, dim), dtype=self.weight.dtype, device=input_ids.device)
         n = input_ids.numel()
@@ -114,9 +115,10 @@ def patch():
             return output
         lib, err = _lib(), ctypes.create_string_buffer(512)
         errores = lib.sple_errores(err, len(err))
-        if errores != _ESTADO.get("errores_vistos", 0):
+        vistos = _ESTADO.get("errores_vistos", 0)
+        if errores != vistos:
             _ESTADO["errores_vistos"] = errores  # each failed request is reported once, not on every later step
-            raise RuntimeError(f"service-ple: fallo en una petición encolada: {err.value.decode(errors='replace')}")
+            raise RuntimeError(f"service-ple: {errores - vistos} peticiones encoladas fallaron; la última: {err.value.decode(errors='replace')}")
         st = getattr(self, "_sple_buf", None)
         if st is None or st[0].numel() < n:
             # fixed addresses: a captured CUDA graph keeps them, so allocate the maximum once (tokens × heads of the prefetch buffer)
@@ -124,7 +126,7 @@ def patch():
                 # graphs captured before keep the old addresses: growing the buffers now would leave them reading freed memory
                 raise RuntimeError("service-ple: buffers too small for this batch after CUDA graph capture")
             cap = max(n, self._prefetch_buffer.shape[0] * self._prefetch_buffer.shape[1])
-            st = (torch.empty(cap, dtype=torch.int64, pin_memory=True), torch.empty(cap * dim, dtype=torch.uint8, pin_memory=True))
+            st = (torch.empty(cap, dtype=torch.int64, pin_memory=True), torch.empty(cap * bf, dtype=torch.uint8, pin_memory=True))
             self._sple_buf = st
         ids_h, filas_h = st
         if torch.cuda.is_current_stream_capturing():
@@ -136,7 +138,7 @@ def patch():
                             si.org_vocab_start_index, si.org_vocab_end_index, filas_h.data_ptr(),
                             int(torch.cuda.is_current_stream_capturing()), err, len(err)):
             raise RuntimeError(f"service-ple: {err.value.decode(errors='replace')}")
-        output.view(torch.uint8).reshape(-1)[: n * dim].copy_(filas_h[: n * dim], non_blocking=True)
+        output.view(torch.uint8).reshape(-1)[: n * bf].copy_(filas_h[: n * bf], non_blocking=True)
         return output
 
     # the global FP8 scale lives in the dropped file: take it from the server (checked against the local header if present)

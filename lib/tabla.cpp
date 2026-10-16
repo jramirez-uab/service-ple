@@ -127,7 +127,7 @@ DescTabla leer_cabecera(const std::string& fichero) {
       if (filas > UINT64_MAX / bf || static_cast<uint64_t>(off[1].ent() - off[0].ent()) != filas * bf) throw std::runtime_error("tamaño de trozo incoherente: " + k);
       d.trozos.push_back({numero, filas, d.inicio_datos + static_cast<uint64_t>(off[0].ent())});
     } else if (k.ends_with("weight_scale")) {
-      if (o.at("dtype").cad() != "BF16") throw std::runtime_error("escala no BF16");
+      if (o.at("dtype").cad() != "BF16" || off[1].ent() - off[0].ent() != 2) throw std::runtime_error("escala no válida (un solo BF16): " + k);
       if (hay_escala) throw std::runtime_error("más de una escala (weight_scale): " + k);
       escala_desp = d.inicio_datos + static_cast<uint64_t>(off[0].ent());
       hay_escala = true;

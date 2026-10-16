@@ -20,6 +20,7 @@
 #include <ctime>
 #include <mutex>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -41,14 +42,19 @@ namespace {
 
 using namespace sple;
 
+// no lanza: se llama desde los catch de los hilos, y un bad_alloc aquí (sin memoria) terminaría el proceso entero
 template <class... A>
-void log(const char* f, A&&... a) {
+void log(const char* f, A&&... a) noexcept {
   std::time_t t = std::time(nullptr);
   std::tm tm{};
   ::localtime_r(&t, &tm);
   char hora[32];
   std::strftime(hora, sizeof hora, "%F %T", &tm);
-  std::fputs((std::string(hora) + " " + sple::formato(f, std::forward<A>(a)...) + "\n").c_str(), stdout);
+  try {
+    std::fputs((std::string(hora) + " " + sple::formato(f, std::forward<A>(a)...) + "\n").c_str(), stdout);
+  } catch (...) {
+    std::fprintf(stdout, "%s (mensaje perdido: sin memoria)\n", hora);
+  }
   std::fflush(stdout);
 }
 
@@ -326,9 +332,15 @@ int main(int argc, char** argv) {
         }
         throw std::runtime_error(std::string("accept: ") + std::strerror(errno));
       }
-      std::thread([&ag, c] {
-        try { ag.atender(c); } catch (const std::exception& ex) { log("conexión local: error ({}); se cierra", ex.what()); ::close(c); }  // no tirar el agente
-      }).detach();
+      try {
+        std::thread([&ag, c] {
+          try { ag.atender(c); } catch (const std::exception& ex) { log("conexión local: error ({}); se cierra", ex.what()); ::close(c); }  // no tirar el agente
+        }).detach();
+      } catch (const std::exception& ex) {  // sin hilos (system_error) o sin memoria: se rechaza esta conexión, no se cae el agente
+        log("no se puede crear un hilo para una conexión local ({}); se cierra", ex.what());
+        ::close(c);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      }
     }
   } catch (const std::exception& e) {
     log("ERROR: {}", e.what());

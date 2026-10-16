@@ -15,13 +15,16 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <atomic>
 #include <chrono>
 #include <ctime>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <mutex>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -33,9 +36,18 @@ namespace {
 using namespace sple;
 using Reloj = std::chrono::steady_clock;
 
-int entero_env(const char* nombre, int defecto) {
+// entero de una variable de entorno en [min, max]; si falta o no es un número, el valor por defecto (atoi daba 0 con «abc»: esperas de 1 ms)
+int entero_env(const char* nombre, int defecto, int min = 0, int max = 600000) {
   const char* e = std::getenv(nombre);
-  return e && *e ? std::atoi(e) : defecto;
+  if (!e || !*e) return defecto;
+  char* fin = nullptr;
+  errno = 0;
+  long v = std::strtol(e, &fin, 10);
+  if (errno || *fin || v < min || v > max) {
+    std::fprintf(stderr, "service-ple: %s=%s no es válido (de %d a %d); se usa %d\n", nombre, e, min, max, defecto);
+    return defecto;
+  }
+  return static_cast<int>(v);
 }
 
 void aviso(const std::string& m) {
@@ -63,8 +75,9 @@ struct Conexion {
   std::string error;
   // robustez
   // al menos 1 ms: un timeval {0, 0} en SO_RCVTIMEO es «sin límite» y un servidor colgado pararía el motor para siempre
-  const int espera_ms = std::max(1, entero_env("SERVICE_PLE_ESPERA_MS", 2000));
-  const int conexion_ms = std::max(1, entero_env("SERVICE_PLE_CONEXION_MS", 300));
+  // cada espera, como mucho 10 min: así 2 × espera_ms (tope total de un envío o una respuesta) no desborda
+  const int espera_ms = entero_env("SERVICE_PLE_ESPERA_MS", 2000, 1);
+  const int conexion_ms = entero_env("SERVICE_PLE_CONEXION_MS", 300, 1);
   const bool degradar = entero_env("SERVICE_PLE_DEGRADAR", 1) != 0;
   uint64_t huella0 = 0;  // la tabla del primer INFO: al reconectar, el servidor tiene que dar la misma
   bool caido = false;
@@ -234,8 +247,10 @@ struct Conexion {
 
   bool enviar(const void* b, size_t n) {
     auto* p = static_cast<const uint8_t*>(b);
+    // SO_SNDTIMEO vale para cada send: un servidor que lee muy despacio alargaría el envío sin fin. Tope del total: 2 × espera_ms
+    const auto limite = Reloj::now() + std::chrono::milliseconds(2 * espera_ms);
     while (n) {
-      ssize_t r = ::send(fd, p, n, MSG_NOSIGNAL);
+      ssize_t r = Reloj::now() > limite ? (errno = EAGAIN, -1) : ::send(fd, p, n, MSG_NOSIGNAL);
       if (r <= 0) {
         agotado = r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);  // como en recibir: un servidor colgado no se reintenta en el acto
         error = std::string("envío: ") + std::strerror(errno);
@@ -299,14 +314,30 @@ std::atomic<uint64_t> errores{0};
 
 int sple_filas_impl(Conexion* c, const int64_t* ids, uint64_t n, int64_t lo, int64_t hi, uint8_t* out, std::string& error);
 
-void ejecutar_encargo(void* p) {
+// ninguna excepción (bad_alloc al crecer un búfer, system_error de un mutex) puede salir por la interfaz C ni desde el nodo de host de CUDA:
+// las dos acaban en std::terminate y tiran el motor entero. Se escriben ceros y se devuelve el error.
+int sple_filas_seguro(Conexion* c, const int64_t* ids, uint64_t n, int64_t lo, int64_t hi, uint8_t* out, std::string& error) noexcept {
+  try {
+    return sple_filas_impl(c, ids, n, lo, hi, out, error);
+  } catch (const std::exception& ex) {
+    try { error = std::string("error interno: ") + ex.what(); } catch (...) {}
+  } catch (...) {
+    try { error = "error interno"; } catch (...) {}
+  }
+  if (const uint32_t bf = c->info.bytes_fila; out && n) std::memset(out, 0, n * bf);
+  return -1;
+}
+
+void ejecutar_encargo(void* p) noexcept {
   auto* e = static_cast<Encargo*>(p);
   std::string error;
-  if (sple_filas_impl(e->c, e->ids, e->n, e->lo, e->hi, e->out, error) != 0) {
-    // no se puede lanzar una excepción desde aquí: ceros (ya escritos por sple_filas_impl) y error pendiente para el motor
-    std::lock_guard g(mx_error);
-    ultimo_error = error;
+  if (sple_filas_seguro(e->c, e->ids, e->n, e->lo, e->hi, e->out, error) != 0) {
+    // no se puede lanzar una excepción desde aquí: ceros (ya escritos) y error pendiente para el motor
     ++errores;
+    try {
+      std::lock_guard g(mx_error);
+      ultimo_error = error;
+    } catch (...) {}
     std::fprintf(stderr, "service-ple: %s\n", error.c_str());
   }
   if (!e->persistente) delete e;
@@ -326,19 +357,30 @@ CuLaunchHostFunc cu_launch_host_func() {
 extern "C" {
 
 // "host:puerto" → manejador, o nullptr con el motivo en err
+static void* sple_abrir_impl(const char* direccion, char* err, int errlen);
 void* sple_abrir(const char* direccion, char* err, int errlen) {
+  try {
+    return sple_abrir_impl(direccion, err, errlen);
+  } catch (...) {  // sin memoria: un error, no std::terminate a través de la interfaz C (literal corto: no reserva memoria)
+    if (err && errlen > 0) std::snprintf(err, static_cast<size_t>(errlen), "%s", "error interno (sin memoria)");
+    return nullptr;
+  }
+}
+
+static void* sple_abrir_impl(const char* direccion, char* err, int errlen) {
   // "destino[;destino...]": cada destino es "unix:/ruta" (agente local) o "host:puerto" (servidor); se usan en ese orden
   std::string d = direccion ? direccion : "";
-  auto* c = new Conexion;
+  std::unique_ptr<Conexion> propia(new Conexion);  // se libera sola si algo lanza a medio camino
+  auto* c = propia.get();
   for (size_t i = 0; i <= d.size();) {
     size_t j = d.find(';', i);
     if (j == std::string::npos) j = d.size();
     if (j > i) c->destinos.push_back(d.substr(i, j - i));
     i = j + 1;
   }
-  if (c->destinos.empty()) { copiar_error("dirección vacía", err, errlen); delete c; return nullptr; }
-  if (!c->conectar()) { copiar_error(c->error, err, errlen); delete c; return nullptr; }
-  return c;
+  if (c->destinos.empty()) { copiar_error("dirección vacía", err, errlen); return nullptr; }
+  if (!c->conectar()) { copiar_error(c->error, err, errlen); return nullptr; }
+  return propia.release();
 }
 
 // No cerrar mientras quede trabajo encolado con sple_encolar ni grafos CUDA capturados que lo usen (guardan el manejador).
@@ -358,7 +400,7 @@ int sple_info(void* h, uint64_t* filas, uint32_t* bytes_fila, uint16_t* escala_b
 // Devuelve 0 si va bien; si no, -1 con el motivo en err. Reintenta una vez reconectando.
 int sple_filas(void* h, const int64_t* ids, uint64_t n, int64_t lo, int64_t hi, uint8_t* out, char* err, int errlen) {
   std::string error;
-  int r = sple_filas_impl(static_cast<Conexion*>(h), ids, n, lo, hi, out, error);
+  int r = sple_filas_seguro(static_cast<Conexion*>(h), ids, n, lo, hi, out, error);
   if (r) copiar_error(error, err, errlen);
   return r;
 }
@@ -369,7 +411,8 @@ int sple_filas(void* h, const int64_t* ids, uint64_t n, int64_t lo, int64_t hi, 
 int sple_encolar(void* h, void* stream, const int64_t* ids, uint64_t n, int64_t lo, int64_t hi, uint8_t* out, int persistente, char* err, int errlen) {
   auto f = cu_launch_host_func();
   if (!f) { copiar_error("no se encuentra cuLaunchHostFunc en libcuda.so.1", err, errlen); return -1; }
-  auto* e = new Encargo{static_cast<Conexion*>(h), ids, n, lo, hi, out, persistente != 0};
+  auto* e = new (std::nothrow) Encargo{static_cast<Conexion*>(h), ids, n, lo, hi, out, persistente != 0};
+  if (!e) { copiar_error("sin memoria para encolar", err, errlen); return -1; }
   if (int r = f(stream, ejecutar_encargo, e); r != 0) {
     delete e;
     copiar_error("cuLaunchHostFunc devolvió " + std::to_string(r), err, errlen);

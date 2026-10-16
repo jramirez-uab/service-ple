@@ -15,6 +15,7 @@
 #include <cstring>
 #include <ctime>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -31,14 +32,19 @@ namespace {
 using namespace sple;
 using Reloj = std::chrono::steady_clock;
 
+// no lanza: se llama desde los catch de los hilos, y un bad_alloc aquí (sin memoria) terminaría el proceso entero
 template <class... A>
-void log(const char* f, A&&... a) {
+void log(const char* f, A&&... a) noexcept {
   std::time_t t = std::time(nullptr);
   std::tm tm{};
   ::localtime_r(&t, &tm);
   char hora[32];
   std::strftime(hora, sizeof hora, "%F %T", &tm);
-  std::fputs((std::string(hora) + " " + sple::formato(f, std::forward<A>(a)...) + "\n").c_str(), stdout);
+  try {
+    std::fputs((std::string(hora) + " " + sple::formato(f, std::forward<A>(a)...) + "\n").c_str(), stdout);
+  } catch (...) {
+    std::fprintf(stdout, "%s (mensaje perdido: sin memoria)\n", hora);
+  }
   std::fflush(stdout);
 }
 
@@ -249,7 +255,14 @@ int main(int argc, char** argv) {
       char txt[INET6_ADDRSTRLEN] = "?";
       ::inet_ntop(AF_INET6, &cli.sin6_addr, txt, sizeof txt);
       std::string quien = sple::formato("{}:{}", txt, ntohs(cli.sin6_port));
-      std::thread(atender, c, std::move(quien), std::cref(d), m.p, std::ref(e)).detach();
+      // sin hilos (límite de procesos o memoria): se rechaza esta conexión, no se cae el servidor
+      try {
+        std::thread(atender, c, std::move(quien), std::cref(d), m.p, std::ref(e)).detach();
+      } catch (const std::exception& ex) {  // system_error (sin hilos) o bad_alloc al copiar los argumentos
+        log("no se puede crear un hilo para una conexión ({}); se cierra", ex.what());
+        ::close(c);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      }
     }
   } catch (const std::exception& ex) {
     log("ERROR: {}", ex.what());

@@ -31,7 +31,7 @@ std::enable_if_t<std::is_arithmetic_v<T>> uno(std::string& out, const std::strin
     std::snprintf(buf, sizeof buf, "%s", v ? "true" : "false");
   } else {
     bool hex = tipo == 'x' || tipo == 'X';
-    if (hex) f.pop_back();
+    if (hex || tipo == 'd' || tipo == 'i' || tipo == 'u') f.pop_back();  // el tipo lo pone abajo con «ll» ({:d} daba "%dlld")
     if constexpr (std::is_signed_v<T>) {
       f += hex ? std::string("ll") + tipo : "lld";
       std::snprintf(buf, sizeof buf, f.c_str(), static_cast<long long>(v));
