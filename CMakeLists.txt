@@ -34,4 +34,10 @@ foreach(t prueba caidas perdidas robustez preferido)
   target_link_libraries(service-ple-test-${t} PRIVATE sple_tabla Threads::Threads ${CMAKE_DL_LIBS})
 endforeach()
 
+# measurement tools: load generator (any destination) and 4 KB random reads (the disk behind an agent without a server)
+add_executable(service-ple-carga bench/carga.cpp)
+target_link_libraries(service-ple-carga PRIVATE serviceple Threads::Threads)
+add_executable(service-ple-lecturas bench/lecturas.cpp)
+target_link_libraries(service-ple-lecturas PRIVATE Threads::Threads)
+
 install(TARGETS service-ple-server service-ple-agent serviceple)

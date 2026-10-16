@@ -1,6 +1,6 @@
 // service-ple: generador de carga. N conexiones (un hilo y un manejador cada una) piden sin pausa F filas al azar durante S segundos.
-// Uso: service-ple-carga destino conexiones filas_por_peticion segundos
-// Compilar: g++ -O2 -std=c++20 bench/carga.cpp -o build/service-ple-carga -Lbuild -lserviceple -Wl,-rpath,$PWD/build -pthread
+// Uso: service-ple-carga destino conexiones filas_por_peticion segundos [rango]  (rango: ids en [0, rango); por defecto toda la tabla)
+// Se compila con el resto (build/service-ple-carga).
 // Salida: peticiones/s, filas/s, MB/s y latencia p50/p99/máx de una petición (ms).
 #include <algorithm>
 #include <atomic>
@@ -20,11 +20,12 @@ void sple_cerrar(void*);
 }
 
 int main(int argc, char** argv) {
-  if (argc != 5) { std::fprintf(stderr, "uso: %s destino conexiones filas_por_peticion segundos\n", argv[0]); return 2; }
+  if (argc != 5 && argc != 6) { std::fprintf(stderr, "uso: %s destino conexiones filas_por_peticion segundos [rango]\n", argv[0]); return 2; }
   const char* destino = argv[1];
   const int conexiones = std::atoi(argv[2]);
   const uint64_t f = std::strtoull(argv[3], nullptr, 10);
   const int segundos = std::atoi(argv[4]);
+  if (conexiones < 1 || f == 0 || segundos < 1) { std::fprintf(stderr, "conexiones, filas y segundos: al menos 1\n"); return 2; }
   std::vector<void*> h(conexiones);
   uint64_t filas = 0;
   uint32_t bf = 0;
@@ -34,6 +35,8 @@ int main(int argc, char** argv) {
     uint16_t esc; uint64_t hu;
     sple_info(h[i], &filas, &bf, &esc, &hu);
   }
+  const uint64_t rango = argc == 6 ? std::min<uint64_t>(std::strtoull(argv[5], nullptr, 10), filas) : filas;
+  if (rango == 0) { std::fprintf(stderr, "rango: al menos 1\n"); return 2; }
   std::atomic<bool> parar{false};
   std::atomic<uint64_t> errores{0};
   std::vector<std::vector<double>> lat(conexiones);
@@ -41,7 +44,7 @@ int main(int argc, char** argv) {
   for (int i = 0; i < conexiones; ++i)
     t.emplace_back([&, i] {
       std::mt19937_64 g(1234 + i);
-      std::uniform_int_distribution<int64_t> d(0, static_cast<int64_t>(filas) - 1);
+      std::uniform_int_distribution<int64_t> d(0, static_cast<int64_t>(rango) - 1);
       std::vector<int64_t> ids(f);
       std::vector<uint8_t> out(f * bf);
       char e[512];

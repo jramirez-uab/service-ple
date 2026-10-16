@@ -5,19 +5,22 @@
 // seguidos (10) pasa a leer las filas del disco (misma huella comprobada) y solo vuelve a probar la red cada --reintento-red s (30).
 // Antes de llegar al umbral, o sin fichero, contesta con error y el motor sigue con ceros.
 // Sin --servidor (solo --fichero): agente solo local, la caché compartida delante y el disco detrás, sin red.
-// Uso: service-ple-agent [--servidor host:puerto] [--socket /run/service-ple/agente.sock] [--filas 16777216] [--fichero ple-fp8.safetensors] [--hilos-disco 16] [--fallos-para-disco 10] [--reintento-red 30]
+// Uso: service-ple-agent [--servidor host:puerto] [--socket /run/service-ple/agente.sock] [--filas 16777216] [--fichero ple-fp8.safetensors] [--hilos-disco 64] [--fallos-para-disco 10] [--reintento-red 30]
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
 #include <sys/un.h>
 #include <unistd.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <list>
 #include <mutex>
 #include <string>
 #include <system_error>
@@ -78,13 +81,32 @@ bool enviar_todo(int fd, const void* buf, size_t n) {
   return true;
 }
 
-// Respaldo en disco: lecturas sueltas de una fila (pread) repartidas entre varios hilos
+// Respaldo en disco: lecturas sueltas de una fila (pread). Un grupo fijo de hilos se reparte las peticiones en trozos de 8 filas, por turnos
+// entre las peticiones abiertas: un paso de decodificación (unos cientos de filas) usa todos los hilos sin crearlos cada vez, y una petición
+// grande de un motor no deja esperando a las pequeñas de otro. Un NVMe necesita decenas de lecturas en vuelo para rendir (dcc-gr6, 10-16:
+// con 16 hilos y trozos de 64, una petición de 256 filas solo usaba 4 hilos: 18.000 filas/s).
 struct Disco {
+  static constexpr size_t TROZO = 8;
   int fd = -1;
   std::string ruta;
   DescTabla d;
-  int hilos = 16;
+  int hilos = 64;
   std::atomic<uint64_t> filas_leidas{0};
+
+  struct Peticion {  // una llamada a leer(); vive en la pila de quien llama hasta que se han leído todas sus filas
+    const std::vector<int64_t>* ids = nullptr;
+    uint8_t* out = nullptr;
+    size_t siguiente = 0;  // primera fila sin repartir (bajo mx_cola)
+    size_t hechas = 0;     // filas ya leídas (bajo mx)
+    std::atomic<bool> ok{true};
+    std::mutex mx;
+    std::condition_variable fin;
+  };
+  std::mutex mx_cola;
+  std::condition_variable_any hay;
+  std::list<Peticion*> abiertas;  // con filas sin repartir; list: rotar y quitar no reservan memoria
+  std::vector<std::jthread> grupo;
+
   // huella_servidor = 0: sin servidor (agente solo local), se acepta la tabla del fichero
   bool abrir(const std::string& fichero, uint64_t huella_servidor) {
     d = leer_cabecera(fichero);
@@ -94,25 +116,69 @@ struct Disco {
     if (fd < 0) throw std::runtime_error("no se puede abrir " + fichero);
     ruta = fichero;
     ::posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+    // cada fila (160 B) cuesta un bloque entero del sistema de ficheros: con los 1 MB de un dataset ZFS por defecto, unas 3.000 filas/s.
+    // Y ZFS, aun con bloques de 4 KB, no pasa de unas 95.000 lecturas al azar por segundo (en dcc-gr6; XFS en el mismo NVMe, 426.000)
+    struct stat st{};
+    struct statfs sf{};
+    const bool zfs = ::fstatfs(fd, &sf) == 0 && static_cast<unsigned long>(sf.f_type) == 0x2fc12fc1ul;  // ZFS_SUPER_MAGIC
+    if (::fstat(fd, &st) == 0 && st.st_blksize > 16384)
+      log("AVISO: {} está en bloques de {} KB: cada fila leída del disco lee un bloque entero (en dcc-gr6, 1 MB → unas 3.000 filas/s, 4 KB → 95.000). "
+          "Pon la tabla en un sistema de ficheros con bloques de 4 KB (XFS o ext4)", fichero, st.st_blksize / 1024);
+    else if (zfs)
+      log("AVISO: {} está en ZFS: las lecturas al azar de 4 KB no pasan de unas 95.000/s (en dcc-gr6; XFS en el mismo NVMe, 426.000). "
+          "Para el agente sin servidor, mejor XFS o ext4", fichero);
+    for (int i = 0; i < hilos; ++i) grupo.emplace_back([this](std::stop_token st) { trabajar(st); });
     return true;
   }
   explicit operator bool() const { return fd >= 0; }
-  bool leer(const std::vector<int64_t>& ids, uint8_t* out) {
+
+  bool leer_filas(Peticion& p, size_t desde, size_t hasta) {
     const uint32_t bf = d.bytes_fila;
-    std::atomic<bool> ok{true};
-    std::atomic<size_t> sig{0};
-    auto trabajo = [&] {
-      for (size_t k; ok && (k = sig.fetch_add(64)) < ids.size();)
-        for (size_t i = k; i < std::min(k + 64, ids.size()); ++i) {
-          uint64_t id = static_cast<uint64_t>(ids[i]), t = id / d.filas_por_trozo, f = id % d.filas_por_trozo;
-          if (t >= d.trozos.size() || ::pread(fd, out + i * bf, bf, static_cast<off_t>(d.trozos[t].desplazamiento + f * bf)) != static_cast<ssize_t>(bf)) { ok = false; break; }
-        }
-    };
-    int n = static_cast<int>(std::min<size_t>(hilos, (ids.size() + 63) / 64));
-    if (n <= 1) trabajo();
-    else { std::vector<std::jthread> h; for (int i = 0; i < n; ++i) h.emplace_back(trabajo); }
-    if (ok) filas_leidas += ids.size();
-    return ok;
+    const auto& ids = *p.ids;
+    for (size_t i = desde; i < hasta; ++i) {
+      uint64_t id = static_cast<uint64_t>(ids[i]), t = id / d.filas_por_trozo, f = id % d.filas_por_trozo;
+      if (t >= d.trozos.size() || ::pread(fd, p.out + i * bf, bf, static_cast<off_t>(d.trozos[t].desplazamiento + f * bf)) != static_cast<ssize_t>(bf)) return false;
+    }
+    return true;
+  }
+
+  void trabajar(std::stop_token st) {
+    for (;;) {
+      Peticion* p;
+      size_t desde, hasta;
+      {
+        std::unique_lock l(mx_cola);
+        if (!hay.wait(l, st, [&] { return !abiertas.empty(); })) return;
+        p = abiertas.front();
+        desde = p->siguiente;
+        hasta = std::min(desde + TROZO, p->ids->size());
+        p->siguiente = hasta;
+        if (hasta == p->ids->size()) abiertas.pop_front();                      // repartida entera: nadie más la verá
+        else abiertas.splice(abiertas.end(), abiertas, abiertas.begin());     // por turnos con las demás
+      }
+      if (!leer_filas(*p, desde, hasta)) p->ok = false;
+      std::lock_guard g(p->mx);  // bajo el cerrojo: quien espera no puede volver (y destruir p) hasta que lo soltemos
+      if ((p->hechas += hasta - desde) == p->ids->size()) p->fin.notify_one();
+    }
+  }
+
+  bool leer(const std::vector<int64_t>& ids, uint8_t* out) {
+    Peticion p;
+    p.ids = &ids;
+    p.out = out;
+    if (ids.size() <= TROZO || grupo.empty()) {
+      p.ok = leer_filas(p, 0, ids.size());
+    } else {
+      {
+        std::lock_guard g(mx_cola);
+        abiertas.push_back(&p);  // si esto lanza, aún nadie apunta a p
+      }
+      hay.notify_all();
+      std::unique_lock l(p.mx);
+      p.fin.wait(l, [&] { return p.hechas == ids.size(); });
+    }
+    if (p.ok) filas_leidas += ids.size();
+    return p.ok;
   }
 };
 
@@ -241,7 +307,7 @@ int main(int argc, char** argv) {
   std::string servidor, socket_ruta = "/run/service-ple/agente.sock";
   uint64_t filas = 16ull << 20;
   std::string fichero;
-  int hilos_disco = 16, fallos_para_disco = 10, reintento_red = 30;
+  int hilos_disco = 64, fallos_para_disco = 10, reintento_red = 30;
   for (int i = 1; i < argc; i += 2) {
     std::string a = argv[i];
     if (i + 1 >= argc) { std::fprintf(stderr, "falta el valor de %s\n", a.c_str()); return 2; }

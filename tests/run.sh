@@ -13,6 +13,10 @@ kill $A; wait $A 2>/dev/null || true
 $P --servidor "unix:$T/a.sock;127.0.0.1:18499" | tail -1
 $B/service-ple-agent --socket $T/b.sock --filas 1024 --fichero $T/t.safetensors > $T/b.log 2>&1 & sleep 2
 $P --servidor "unix:$T/b.sock" | tail -1
+# the agent alone under load (16 connections, random rows, cache of 1024): rows still byte-exact and no request fails
+$B/service-ple-carga "unix:$T/b.sock" 16 256 4 > $T/carga.out 2>&1 & L=$!
+v=$($P --servidor "unix:$T/b.sock" | tail -1); wait $L || true
+[ "$v" = "RESULTADO: OK" ] && grep -q "errores 0$" $T/carga.out && echo "RESULTADO: OK" || echo "RESULTADO: FALLO (agente solo con carga: $v; $(cat $T/carga.out))"
 # the engine starts before the agent (falls back to the server) and must move to the agent when it appears (about 35 s)
 $B/service-ple-test-preferido "unix:$T/c.sock;127.0.0.1:18499" 36 > $T/p.out 2>&1 & Q=$!; sleep 2
 $B/service-ple-agent --servidor 127.0.0.1:18499 --socket $T/c.sock --filas 1024 > $T/c.log 2>&1 & C=$!
